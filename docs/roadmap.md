@@ -205,6 +205,8 @@ Same shape as v0.8.1 — stabilize on defects that surfaced since v0.9.0 shipped
 - [x] A bare `-` marker alone on its line isn't recognized as a list item by python-markdown regardless of indentation — distinct from the tracked `sane_lists` threshold bug. Found in the v0.9.0 QA pass; documented as a known limitation rather than fixed (PR #733) ([#692](https://github.com/khuisman/mcp-gee-sweet/issues/692))
 - [ ] `create_spreadsheet`/`import_csv_to_sheet` response has no web link, unlike sibling create/copy tools — enhancement or fix TC-D01's expectation instead, still open. Found in the v0.9.0 QA pass ([#693](https://github.com/khuisman/mcp-gee-sweet/issues/693))
 - [x] PyPI project page drops the logo — README `<img src>` is a relative path, which PyPI's `readme_renderer` strips. Found on the published v0.9.0 page (PR #707) ([#706](https://github.com/khuisman/mcp-gee-sweet/issues/706))
+- [ ] `sync_folder`/`upload_local_file` convert: Drive's `modifiedTime` for a Google Doc lags real edits by minutes, and the async import can overwrite the post-create restamp. Change detection for `convert_markdown` Docs needs a new signal. Joy scopes; decision doc in PR #819 ([#814](https://github.com/khuisman/mcp-gee-sweet/issues/814))
+- [ ] auth: with no `token.json`, a stdio server blocks on OAuth consent with no timeout, and the consent prompt goes to the protocol channel ([#811](https://github.com/khuisman/mcp-gee-sweet/issues/811))
 
 **Sheets hardening** _(triaged out of `backlog` 2026-09-11 — see the "Backlog triage" note below)_
 - [x] `update_sheet_properties`/dimension-tool hardening + dedup follow-ups from PR #321's review ([#323](https://github.com/khuisman/mcp-gee-sweet/issues/323)) (PR #734)
@@ -294,11 +296,14 @@ Same shape as v0.8.1 — stabilize on defects that surfaced since v0.9.0 shipped
 - [x] Gmail scopes opt-in + verify granted scopes at startup. Existing OAuth tokens weren't granted the new scopes, so refresh likely fails into a surprise browser consent or a headless hang. **Must ship in the same release as #786** ([#790](https://github.com/khuisman/mcp-gee-sweet/issues/790)) (PR #807)
 - [x] `reply_to_message` should honor Reply-To and handle replies to your own sent mail ([#791](https://github.com/khuisman/mcp-gee-sweet/issues/791)) (PR #815)
 - [x] Decode message bodies using the part's charset; tolerate missing base64 padding ([#792](https://github.com/khuisman/mcp-gee-sweet/issues/792)) (PR #816)
+- [ ] `get_message`/`get_thread` return no body when Gmail delivers a large (~MB) `text/plain`/`text/html` part by `attachmentId`. Found in #803's live QA ([#825](https://github.com/khuisman/mcp-gee-sweet/issues/825))
 - [ ] `get_thread`/`get_message`: add a body-less option — a long thread trips the response-size cap and there's no other way to get its message IDs, so it can't be read at all ([#793](https://github.com/khuisman/mcp-gee-sweet/issues/793))
 - [ ] Reply-all self-exclusion (silent `getProfile` failure, send-as aliases), attachment reads blocking the event loop, attachment MIME guessing ([#802](https://github.com/khuisman/mcp-gee-sweet/issues/802))
 - [ ] Deduplicate `send_message`/`create_draft` compose and `list_messages`/`list_threads` kwargs/pagination helpers ([#795](https://github.com/khuisman/mcp-gee-sweet/issues/795))
 - [ ] Local-file read policy across local-path tools — in a remote/SSE deployment these read the server's own filesystem (token, SA key), and Gmail attachments can now mail them out. One consistent policy (e.g. a config switch), not per-tool patches. Decision-needed; Joy scopes ([#796](https://github.com/khuisman/mcp-gee-sweet/issues/796))
 - [ ] Release-pass Gmail QA (`docs/qa/tests/gmail.md`, added by #786). Many cases are destructive (send/draft/trash), so they need a dedicated mailbox fixture plan — Aziz ([#803](https://github.com/khuisman/mcp-gee-sweet/issues/803))
+- [ ] Rewrite TC-GM01–22 prescriptively, add TC-GM26–44 and the Smoke rows, per `docs/qa/gmail-test-plan.md` §4. Part of #803, Aziz ([#822](https://github.com/khuisman/mcp-gee-sweet/issues/822))
+- [ ] Gmail unit-test hardening: MIME build branches, label validation, subject normalization, `max_results` clamping (plan §5 P4–P9; nothing observed failing) ([#823](https://github.com/khuisman/mcp-gee-sweet/issues/823))
 
 Tool surface (from the original v1.1+ plan):
 
@@ -348,6 +353,11 @@ Follows the design in [`docs/decisions/decision-comments-first-class.md`](decisi
 - [ ] Fix the stale Tier 4 "zero comment tooling on Docs today" line; close or re-scope #142 (asks for what #151 already shipped under different naming). ([#662](https://github.com/khuisman/mcp-gee-sweet/issues/662))
 - [ ] **Decision needed:** deprecate `share_spreadsheet` in favor of `share_file` (a strict superset over the same `permissions()` resource), or keep both and document why. Same pattern as #151/#142, with a longer compatibility tail. ([#665](https://github.com/khuisman/mcp-gee-sweet/issues/665))
 - [ ] Follow-up cleanup for the docs comments API (`add_doc_comment`/`resolve_doc_comment`/`list_doc_comments`) — same surface #663/#664 generalize, do it there rather than twice; triaged out of `backlog` 2026-09-11 ([#329](https://github.com/khuisman/mcp-gee-sweet/issues/329))
+
+**Drive & Docs follow-ups** _(triaged 2026-09-26; off this release's comments theme, but version-labeled v0.9.2 at filing)_
+
+- [ ] `sync_folder(export_format=...)`: converted Sheets/Slides probably have #814's `modifiedTime` lag and restamp race too. Suspected, not yet observed ([#818](https://github.com/khuisman/mcp-gee-sweet/issues/818))
+- [ ] Add a tool to set (and read back) Google Docs table column widths — `tableColumnProperties` isn't reachable through any tool today ([#809](https://github.com/khuisman/mcp-gee-sweet/issues/809))
 
 **Code structure & typing (Joy)** _(slotted into v0.9.2 2026-09-09 so Joy's architecture initiative carries release deadlines instead of staying open-ended)_
 
