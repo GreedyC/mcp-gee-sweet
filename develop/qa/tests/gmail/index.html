@@ -1266,6 +1266,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#tc-gm26-non-utf-8-labeled-bodies-still-decode-correctly-issue-792-requires-oauth" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TC-GM26: Non-UTF-8-labeled bodies still decode correctly (issue #792) ⚠️ requires-oauth
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1913,6 +1924,57 @@
 <p><strong>Checks</strong>
 - Returns <code>{"error": "..."}</code> — not a top-level exception</p>
 <hr />
+<h3 id="tc-gm26-non-utf-8-labeled-bodies-still-decode-correctly-issue-792-requires-oauth">TC-GM26: Non-UTF-8-labeled bodies still decode correctly (issue #792) ⚠️ requires-oauth<a class="headerlink" href="#tc-gm26-non-utf-8-labeled-bodies-still-decode-correctly-issue-792-requires-oauth" title="Permanent link">&para;</a></h3>
+<p><strong>Background:</strong> #792 assumed <code>get_message</code>/<code>get_thread</code> garble ISO-8859-1 / Windows-1252 / Shift_JIS mail because they decode <code>body.data</code> as UTF-8 regardless of the part's <code>Content-Type</code> charset. PR #816 round 1 showed live that the premise is false. The Gmail API already transcodes every text part's <code>body.data</code> to UTF-8 but keeps the original charset label, so the UTF-8-only decode is correct and decoding with the declared charset garbles. This case now guards that: a part labeled with a non-UTF-8 charset must still come back as the right text. The fixtures are built from raw bytes, not <code>MIMEText</code>. <code>MIMEText(..., 'shift_jis')</code> silently emits <code>charset="iso-2022-jp"</code>, which never exercised Shift_JIS. The fixtures are <em>inserted</em> (not sent), so nothing leaves the QA mailbox.</p>
+<p><strong>Setup:</strong> insert both fixtures with a scratch script from the checkout under test, using the same OAuth token as the server under test (its saved scopes must include <code>gmail.modify</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>uv<span class="w"> </span>run<span class="w"> </span>python3<span class="w"> </span>-<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="s">import base64</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="s">from googleapiclient.discovery import build</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="s">from mcp_gee_sweet.auth import _oauth_creds</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="s">def mime(subject, parts):</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="s">    out = [</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="s">        b&quot;MIME-Version: 1.0&quot;,</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="s">        b&quot;To: qa@example.invalid&quot;,</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="s">        b&quot;Subject: &quot; + subject,</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="s">        b&#39;Content-Type: multipart/alternative; boundary=&quot;tcgm26&quot;&#39;,</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="s">        b&quot;&quot;,</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="s">    ]</span>
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="s">    for ctype, cte, body in parts:</span>
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="s">        out += [b&quot;--tcgm26&quot;, b&quot;Content-Type: &quot; + ctype, b&quot;Content-Transfer-Encoding: &quot; + cte, b&quot;&quot;, body]</span>
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="s">    out += [b&quot;--tcgm26--&quot;, b&quot;&quot;]</span>
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="s">    return b&quot;\r\n&quot;.join(out)</span>
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="s"># A: iso-8859-1 quoted-printable plain part + genuine Shift_JIS base64 html part.</span>
+<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="s">a = mime(b&quot;TC-GM26 charset fixture A&quot;, [</span>
+<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="s">    (b&quot;text/plain; charset=iso-8859-1&quot;, b&quot;quoted-printable&quot;, b&quot;Caf=E9 cr=E8me, na=EFve&quot;),</span>
+<a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="s">    (b&quot;text/html; charset=shift_jis&quot;, b&quot;base64&quot;, base64.b64encode(&quot;&lt;p&gt;こんにちは世界&lt;/p&gt;&quot;.encode(&quot;shift_jis&quot;))),</span>
+<a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="s">])</span>
+<a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="s"># B: windows-1252 8bit plain part (smart quotes and en dash are cp1252-only bytes).</span>
+<a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="s">b = mime(b&quot;TC-GM26 charset fixture B&quot;, [</span>
+<a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="s">    (b&quot;text/plain; charset=windows-1252&quot;, b&quot;8bit&quot;, &quot;“Smart quotes” – 5&quot;.encode(&quot;cp1252&quot;)),</span>
+<a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="s">])</span>
+<a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a>
+<a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="s">g = build(&quot;gmail&quot;, &quot;v1&quot;, credentials=_oauth_creds(), cache_discovery=False)</span>
+<a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="s">for label, raw in ((&quot;A&quot;, a), (&quot;B&quot;, b)):</span>
+<a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="s">    r = g.users().messages().insert(userId=&quot;me&quot;, body={&quot;raw&quot;: base64.urlsafe_b64encode(raw).decode()}).execute()</span>
+<a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="s">    print(label, r[&quot;id&quot;], r[&quot;threadId&quot;])</span>
+<a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a><span class="s">EOF</span>
+</code></pre></div>
+<p>Record fixture A's IDs as <code>{CHARSET_FIXTURE_A_ID}</code> / <code>{CHARSET_THREAD_A_ID}</code>, and fixture B's message ID as <code>{CHARSET_FIXTURE_B_ID}</code>.</p>
+<p><strong>Action</strong>
+1. <code>get_message</code> with <code>message_id: "{CHARSET_FIXTURE_A_ID}"</code>
+2. <code>get_thread</code> with <code>thread_id: "{CHARSET_THREAD_A_ID}"</code>
+3. <code>get_message</code> with <code>message_id: "{CHARSET_FIXTURE_B_ID}"</code></p>
+<p><strong>Checks</strong>
+- Step 1: <code>body_plain</code> is <code>Café crème, naïve</code> and <code>body_html</code> is <code>&lt;p&gt;こんにちは世界&lt;/p&gt;</code> (ignore trailing whitespace), with no mojibake (<code>CafÃ©</code>, <code>縺薙ｓ…</code>) and no <code>�</code> replacement characters
+- Step 2: the one message in <code>messages</code> has the same <code>body_plain</code> / <code>body_html</code> as step 1
+- Step 3: <code>body_plain</code> is <code>“Smart quotes” – 5</code> (ignore trailing whitespace)
+- No <code>error</code> or <code>body_decode_errors</code> field in any response</p>
+<p><strong>Cleanup:</strong> <code>trash_message</code> both fixtures.</p>
+<p><strong>Result</strong> (2026-09-26, PR #816 round 1, <code>mcp-gee-sweet-kit</code>, OAuth token with <code>gmail.modify</code>): <strong>FAIL</strong>. Step 1 <code>body_plain</code> = <code>CafÃ© crÃ¨me, naÃ¯ve</code> (mojibake). <code>body_html</code> = <code>&lt;p&gt;こんにちは世界&lt;/p&gt;</code> (correct). Step 2 identical. No <code>error</code> field. Root cause, confirmed via raw <code>format=full</code> vs <code>format=raw</code> inspection: the Gmail API already transcodes every text part's <code>body.data</code> to UTF-8, while the part's <code>Content-Type</code> header keeps the original charset label. Wire bytes <code>Caf=E9</code> (iso-8859-1 QP) arrive in <code>body.data</code> as <code>Caf\xc3\xa9</code>, so decoding with the declared charset double-decodes. Note: Python's <code>MIMEText(..., 'shift_jis')</code> actually emits <code>charset="iso-2022-jp"</code>, so the fixture's HTML part never exercised Shift_JIS. A second probe with a raw base64 <code>charset=shift_jis</code> part and an 8bit <code>charset=windows-1252</code> part showed the same UTF-8 transcoding. <code>get_message</code> returned the Shift_JIS part as <code>縺薙ｓ縺ｫ縺｡縺ｯ荳也阜</code> (UTF-8 bytes that happen to be valid Shift_JIS). The cp1252 part came out correct only because byte <code>0x9d</code> is undefined in cp1252, which forced the UTF-8 fallback. The pre-#792 UTF-8-only decode was correct for all three. Both fixtures trashed.</p>
+<p><strong>Result</strong> (2026-09-26, PR #816 round 2 at <code>1daec0a</code>, <code>mcp-gee-sweet-kit</code>, OAuth token with <code>gmail.modify</code>): <strong>PASS</strong>. Step 1: <code>body_plain</code> = <code>Café crème, naïve</code>, <code>body_html</code> = <code>&lt;p&gt;こんにちは世界&lt;/p&gt;</code>. Step 2: the one message has identical bodies. Step 3: <code>body_plain</code> = <code>“Smart quotes” – 5</code>. No mojibake, no <code>�</code>, and no <code>error</code> or <code>body_decode_errors</code> field in any response. Both fixtures trashed.</p>
+<hr />
 <h2 id="list_threads"><code>list_threads</code><a class="headerlink" href="#list_threads" title="Permanent link">&para;</a></h2>
 <h3 id="tc-gm05-list-threads-with-a-query">TC-GM05: List threads with a query<a class="headerlink" href="#tc-gm05-list-threads-with-a-query" title="Permanent link">&para;</a></h3>
 <p><strong>Prompt</strong></p>
@@ -2054,20 +2116,20 @@
 <h3 id="tc-gm23-reply-goes-to-the-originals-reply-to-not-its-from-issue-791-destructive-requires-oauth">TC-GM23: Reply goes to the original's Reply-To, not its From (issue #791) ⚠️ destructive ⚠️ requires-oauth<a class="headerlink" href="#tc-gm23-reply-goes-to-the-originals-reply-to-not-its-from-issue-791-destructive-requires-oauth" title="Permanent link">&para;</a></h3>
 <p><strong>Background:</strong> <code>reply_to_message</code> used to always reply to <code>From</code>, so mail with a <code>Reply-To</code> (mailing lists, support desks, no-reply senders) got the reply at the wrong address. #791 resolves <code>Reply-To</code> over <code>From</code>, like a standard mail client. This reproduces the defect without mailing anyone outside the QA mailbox: the original is <em>inserted</em> (not sent) with a fake <code>From</code> and a <code>Reply-To</code> pointing at a plus-address of the QA mailbox itself.</p>
 <p><strong>Setup:</strong> there's no tool for inserting a message, so insert the fixture with a scratch script from the checkout under test, using the same OAuth token as the server under test (its saved scopes must include <code>gmail.modify</code>). Replace <code>&lt;mailbox&gt;</code> with the QA mailbox address, e.g. <code>qa@example.com</code> → <code>qa+tc-gm23@example.com</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>uv<span class="w"> </span>run<span class="w"> </span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="s2">import base64</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="s2">from email.mime.text import MIMEText</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="s2">from googleapiclient.discovery import build</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="s2">from mcp_gee_sweet.auth import _oauth_creds</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="s2">m = MIMEText(&#39;mcp-gee-sweet TC-GM23 fixture&#39;)</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="s2">m[&#39;From&#39;] = &#39;No Reply &lt;noreply@example.invalid&gt;&#39;</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="s2">m[&#39;Reply-To&#39;] = &#39;&lt;mailbox local part&gt;+tc-gm23@&lt;mailbox domain&gt;&#39;</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="s2">m[&#39;To&#39;] = &#39;&lt;mailbox&gt;&#39;</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="s2">m[&#39;Subject&#39;] = &#39;TC-GM23 reply-to fixture&#39;</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="s2">g = build(&#39;gmail&#39;, &#39;v1&#39;, credentials=_oauth_creds(), cache_discovery=False)</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="s2">r = g.users().messages().insert(userId=&#39;me&#39;, body={&#39;raw&#39;: base64.urlsafe_b64encode(m.as_bytes()).decode(), &#39;labelIds&#39;: [&#39;INBOX&#39;]}).execute()</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="s2">print(r[&#39;id&#39;])</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="s2">&quot;</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>uv<span class="w"> </span>run<span class="w"> </span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="s2">import base64</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="s2">from email.mime.text import MIMEText</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="s2">from googleapiclient.discovery import build</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="s2">from mcp_gee_sweet.auth import _oauth_creds</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="s2">m = MIMEText(&#39;mcp-gee-sweet TC-GM23 fixture&#39;)</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="s2">m[&#39;From&#39;] = &#39;No Reply &lt;noreply@example.invalid&gt;&#39;</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="s2">m[&#39;Reply-To&#39;] = &#39;&lt;mailbox local part&gt;+tc-gm23@&lt;mailbox domain&gt;&#39;</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="s2">m[&#39;To&#39;] = &#39;&lt;mailbox&gt;&#39;</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="s2">m[&#39;Subject&#39;] = &#39;TC-GM23 reply-to fixture&#39;</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="s2">g = build(&#39;gmail&#39;, &#39;v1&#39;, credentials=_oauth_creds(), cache_discovery=False)</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="s2">r = g.users().messages().insert(userId=&#39;me&#39;, body={&#39;raw&#39;: base64.urlsafe_b64encode(m.as_bytes()).decode(), &#39;labelIds&#39;: [&#39;INBOX&#39;]}).execute()</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="s2">print(r[&#39;id&#39;])</span>
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="s2">&quot;</span>
 </code></pre></div>
 <p>Record the printed ID as <code>{REPLY_TO_FIXTURE_ID}</code>.</p>
 <p><strong>Action</strong>
