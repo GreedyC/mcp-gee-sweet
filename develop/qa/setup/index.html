@@ -1108,6 +1108,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#gmail-fixture-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gmail fixture setup
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#oauth-token-setup-for-requires-oauth-tests" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1798,6 +1809,53 @@ personal-calendar sharing needed. Seed prompt (paste with MCP server connected):
 subscribe it via <code>calendarList().insert()</code>. See the <code>Calendar API setup</code> memory entry for
 the workaround, or skip calendar tests if you don't need them.</p>
 <p>Add the returned IDs to <code>.env</code> as <code>TEST_CALENDAR_ID</code> and <code>TEST_EVENT_ID</code>.</p>
+<hr />
+<h2 id="gmail-fixture-setup">Gmail fixture setup<a class="headerlink" href="#gmail-fixture-setup" title="Permanent link">&para;</a></h2>
+<p>Gmail cases (<code>tests/gmail.md</code>) read from a seeded fixture set instead of the real inbox.
+The design is in <a href="../gmail-test-plan/"><code>gmail-test-plan.md</code></a> §3. Two mailboxes are involved:</p>
+<ul>
+<li><strong>QA mailbox</strong>: the Workspace fixture-owning account, the one the OAuth servers
+  (<code>mcp-gee-sweet-oauth</code> / <code>-kai-oauth</code>) authenticate as. This is the mailbox under test.</li>
+<li><strong>Sender mailbox</strong>: a second Google account that only exists to send real mail to the
+  QA mailbox. Mail never goes anywhere else.</li>
+</ul>
+<p>Both tokens need the <code>gmail.modify</code> scope, and each token's Cloud project needs the Gmail
+API enabled (Step 0). <code>scripts/qa_gmail_fixtures.py</code> does everything. It refreshes both
+tokens in memory and never writes them back:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">S</span><span class="o">=</span><span class="s2">&quot;uv run python scripts/qa_gmail_fixtures.py&quot;</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="nv">$S</span><span class="w"> </span>seed<span class="w">                                   </span><span class="c1"># label + 12 inserted fixtures, IDs -&gt; .env</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="nv">$S</span><span class="w"> </span>send<span class="w"> </span>--sender-token<span class="w"> </span>&lt;sender<span class="w"> </span>token.json&gt;<span class="w"> </span>--dry-run
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="nv">$S</span><span class="w"> </span>send<span class="w"> </span>--sender-token<span class="w"> </span>&lt;sender<span class="w"> </span>token.json&gt;<span class="w">  </span><span class="c1"># 10 sends + 1 QA reply, waits for delivery</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="nv">$S</span><span class="w"> </span>seed<span class="w">                                   </span><span class="c1"># labels the sent fixtures, un-spams them, IDs -&gt; .env</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="nv">$S</span><span class="w"> </span>status<span class="w">                                 </span><span class="c1"># exit 0 only when all 19 fixtures are present</span>
+</code></pre></div>
+<p><code>--qa-token</code> defaults to <code>TOKEN_PATH</code> (else <code>./token.json</code>), and <code>--env-file</code> defaults
+to the repo-root <code>.env</code>. Every run is idempotent: fixtures are found by exact <code>[mcp-qa:&lt;key&gt;]</code>
+subject and reused. <code>send</code> refuses any recipient except the two mailboxes, with no Cc or Bcc.</p>
+<ul>
+<li><strong>Inserted</strong> fixtures (<code>inline</code>, <code>reply-to</code>, <code>latin1</code>, <code>page-1</code>–<code>7</code>, <code>spam</code>, <code>trash</code>) are
+  planted with <code>messages.insert</code>. Nothing is sent.</li>
+<li><strong>Sent</strong> fixtures (<code>plain</code>, <code>alt-unicode</code>, <code>attachments</code>, <code>thread</code>, <code>forwarded</code>,
+  <code>large-body</code>, <code>over-cap-thread</code>) are really delivered, so their MIME layout is Gmail's own.
+  They go straight through the Gmail API with the sender token, not through <code>send_message</code>:
+  a 3 MB body can't travel as a tool argument, and a real <code>message/rfc822</code> forward
+  can't be built with <code>send_message</code>.</li>
+<li>Gmail's spam filter junks some sender mail; seen live 2026-09-26 for <code>plain</code>,
+  <code>attachments</code>, and <code>large-body</code>. The second <code>seed</code> moves every sent fixture back to
+  <code>INBOX</code>. Rerun <code>seed</code> if a later <code>status</code> or case finds one in Spam again.</li>
+<li>The <code>trash</code> fixture expires after Gmail's 30-day trash retention. <code>seed</code> re-inserts it.</li>
+</ul>
+<p><code>inspect</code> prints the raw Gmail part tree of every fixture: MIME type, size, and whether the
+body arrives as inline <code>data</code> or by <code>attachmentId</code>. This is the ground truth for
+TC-GM27–29.</p>
+<p><code>.env</code> keys written: <code>TEST_GMAIL_ADDRESS</code>, <code>TEST_GMAIL_SENDER_ADDRESS</code>,
+<code>TEST_GMAIL_LABEL_ID</code>, <code>TEST_MESSAGE_ID</code>, <code>TEST_THREAD_ID</code>, <code>TEST_GMAIL_UNICODE_ID</code>,
+<code>TEST_GMAIL_ATTACH_ID</code>, <code>TEST_GMAIL_INLINE_ID</code>, <code>TEST_GMAIL_REPLYTO_ID</code>,
+<code>TEST_GMAIL_FWD_ID</code>, <code>TEST_GMAIL_LARGE_ID</code>, <code>TEST_GMAIL_BIG_THREAD_ID</code>,
+<code>TEST_GMAIL_LATIN1_ID</code>.</p>
+<p><strong>Reset:</strong> <code>reset</code> trashes every labeled fixture and any <code>[mcp-qa</code> message a test run left
+behind, and deletes <code>[mcp-qa</code> drafts. It touches the QA mailbox only. Then run
+<code>send</code> and <code>seed</code> again.</p>
 <hr />
 <h2 id="oauth-token-setup-for-requires-oauth-tests">OAuth token setup (for <code>⚠️ requires-oauth</code> tests)<a class="headerlink" href="#oauth-token-setup-for-requires-oauth-tests" title="Permanent link">&para;</a></h2>
 <p>Tests tagged <code>⚠️ requires-oauth</code> need a valid OAuth token (<code>token.json</code>). If you're running with a service account or ADC, these tests will be skipped or will fail — they require personal Drive access.</p>
