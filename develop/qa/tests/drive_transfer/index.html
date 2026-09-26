@@ -2756,6 +2756,33 @@ Trash <code>{FOLDER_ID}</code> and its contents. Remove <code>/tmp/qa-266/</code
 - Call 4: <code>upload_local_file(convert=True)</code> on <code>&lt;C115&gt;.md</code> returned no error, and the repeated call 2 listed it in <code>skipped</code>.
 - Final listing: exactly 6 Google Docs, no <code>text/markdown</code> files, no orphans or duplicates.
 - Unit suite at <code>2544c93</code>: 1718 passed, 3 skipped.</p>
+<h3 id="tc-d267-upload_local_fileconverttrue-on-a-csv-restamps-the-converted-sheets-modifiedtime-so-a-following-sync_folderexport_formatcsv-reads-it-as-in-sync-issue-435-local-filesystem">TC-D267: <code>upload_local_file(convert=True)</code> on a CSV restamps the converted Sheet's <code>modifiedTime</code>, so a following <code>sync_folder(export_format='csv')</code> reads it as in sync (issue #435) ⚠️ local-filesystem<a class="headerlink" href="#tc-d267-upload_local_fileconverttrue-on-a-csv-restamps-the-converted-sheets-modifiedtime-so-a-following-sync_folderexport_formatcsv-reads-it-as-in-sync-issue-435-local-filesystem" title="Permanent link">&para;</a></h3>
+<p><strong>Background:</strong> Issue #435 proposed restamping <code>modifiedTime</code> only for <code>.md</code> → Doc conversions, on the premise that <code>sync_folder</code> never matches other converted types back to a local file. That premise is false. Drive strips <code>.csv</code> from a converted Sheet's display name, so <code>export_format='csv'</code> maps the Sheet straight back to the local <code>.csv</code>, and the two mtimes are compared. For a Sheet, <code>create()</code> ignores the requested <code>modifiedTime</code> outright. Without the follow-up metadata-only restamp, the pair reads as "Drive newer" on the very next sync. #435 declined the <code>.md</code>-only gate, and both call sites now share one <code>_restamp_modified_time</code> helper. This case guards the non-<code>.md</code> path.</p>
+<p><strong>Setup</strong>
+Create a scratch Drive folder <code>{FOLDER_ID}</code>. Locally, create <code>/tmp/qa-267/data.csv</code> containing <code>a,b\n1,2\n</code>, and set its mtime at least a day in the past (<code>touch -t 202301010000 /tmp/qa-267/data.csv</code>), so an unrestamped Sheet would be far outside the 5-second sync tolerance.</p>
+<p><strong>Tool calls</strong>
+1. <code>upload_local_file(local_path="/tmp/qa-267/data.csv", parent_folder_id={FOLDER_ID}, convert=True, skip_if_exists=False)</code>
+2. <code>get_file_metadata(file_id=&lt;fileId from call 1&gt;)</code>
+3. <code>sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-267/", direction="bidirectional", export_format="csv", dry_run=True)</code></p>
+<p><strong>Checks</strong>
+- Call 1: no <code>error</code>, and a <code>fileId</code> is returned.
+- Call 2: the file is a Google Sheet named <code>data</code> (no <code>.csv</code>). Its <code>modified_time</code> falls on 2022-12-31 or 2023-01-01 (the local 2023-01-01 00:00 mtime, rendered in UTC), not today.
+- Call 3: <code>actions</code> has exactly one entry, for <code>data.csv</code>, with <code>action: "skip"</code>. It is not <code>download</code> or <code>conflict</code>.</p>
+<p><strong>Teardown</strong>
+Trash <code>{FOLDER_ID}</code> and its contents. Remove <code>/tmp/qa-267/</code>.</p>
+<p><strong>Result</strong> (2026-09-26, Sky, PR #817 round 1 at <code>daca371</code>, <code>mcp-gee-sweet-sky</code> reconnected after reset, OAuth, Shared Drive): <strong>PASS</strong>.
+- Call 1: no error; <code>fileId</code> returned, <code>name: "data"</code>.
+- Call 2: <code>mimeType</code> is a Google Sheet named <code>data</code>; <code>modified_time</code> is <code>2023-01-01T08:00:00.000Z</code> (local midnight PST in UTC). Re-read more than 40s later, it was unchanged, so the restamp was not overwritten later by the conversion.
+- Call 3: <code>actions</code> = <code>[{name: "data.csv", action: "skip", reason: "in sync"}]</code>.
+- Extra regression check on <code>sync_folder(convert_markdown=True)</code>, which is <code>_run_one</code>'s side of the shared helper. It used a separate scratch folder and a <code>.md</code> with its mtime set to 2023-01-01. The first sync listed it in <code>uploaded</code>, and the resync listed it in <code>skipped</code>. After a local edit (mtime set to 2024-01-01), the sync reported <code>uploaded</code>, taking the media <code>update()</code> reimport path. Dry-run resyncs immediately afterward and about 40s later both reported <code>skip</code> / "in sync", so the reimport path doesn't drift either.
+- Unit suite at <code>daca371</code>: 1737 passed, 3 skipped; <code>ruff check</code> clean.</p>
+<p><strong>Result</strong> (2026-09-26, Sky, PR #817 round 2 re-verification of <code>b4e6439</code>, <code>mcp-gee-sweet-sky</code> reconnected after reset, OAuth, Shared Drive): <strong>PASS</strong>. Ran the full case again from a fresh folder.
+- Call 1: no error; <code>fileId</code> returned.
+- Call 2: a Google Sheet named <code>data</code>, with <code>modified_time</code> <code>2023-01-01T08:00:00.000Z</code>.
+- Call 3: <code>actions</code> = <code>[{name: "data.csv", action: "skip", reason: "in sync"}]</code>.
+- <code>convert_markdown</code> regression check, run again at <code>b4e6439</code>: upload, then dry-run resync reports <code>skip</code> / "in sync".
+- The round-1 findings are all addressed in <code>b4e6439</code>, confirmed from its diff: the docstring is now consistent, the mtime is read inside the <code>try</code> at both sites (each with a new unit test), a single <code>_local_mtime_dt</code>, the stale comment is dropped, and the restamp test is parametrized.
+- Unit suite at <code>b4e6439</code>: 1739 passed, 3 skipped; ruff check and format are clean.</p>
 
 
 
