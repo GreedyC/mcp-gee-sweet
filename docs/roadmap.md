@@ -206,7 +206,7 @@ Same shape as v0.8.1 — stabilize on defects that surfaced since v0.9.0 shipped
 - [ ] `create_spreadsheet`/`import_csv_to_sheet` response has no web link, unlike sibling create/copy tools — enhancement or fix TC-D01's expectation instead, still open. Found in the v0.9.0 QA pass ([#693](https://github.com/khuisman/mcp-gee-sweet/issues/693))
 - [x] PyPI project page drops the logo — README `<img src>` is a relative path, which PyPI's `readme_renderer` strips. Found on the published v0.9.0 page (PR #707) ([#706](https://github.com/khuisman/mcp-gee-sweet/issues/706))
 - [ ] `sync_folder`/`upload_local_file` convert: Drive's `modifiedTime` for a Google Doc lags real edits by minutes, and the async import can overwrite the post-create restamp. Change detection for `convert_markdown` Docs needs a new signal. Joy scopes; decision doc in PR #819 ([#814](https://github.com/khuisman/mcp-gee-sweet/issues/814))
-- [ ] auth: with no `token.json`, a stdio server blocks on OAuth consent with no timeout, and the consent prompt goes to the protocol channel ([#811](https://github.com/khuisman/mcp-gee-sweet/issues/811))
+- [x] auth: with no `token.json`, a stdio server blocks on OAuth consent with no timeout, and the consent prompt goes to the protocol channel ([#811](https://github.com/khuisman/mcp-gee-sweet/issues/811)) (PR #828)
 
 **Sheets hardening** _(triaged out of `backlog` 2026-09-11 — see the "Backlog triage" note below)_
 - [x] `update_sheet_properties`/dimension-tool hardening + dedup follow-ups from PR #321's review ([#323](https://github.com/khuisman/mcp-gee-sweet/issues/323)) (PR #734)
