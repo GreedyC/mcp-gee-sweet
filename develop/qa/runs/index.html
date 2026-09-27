@@ -1493,9 +1493,20 @@
 <td><code>create_event</code></td>
 <td><code>tests/calendar.md</code></td>
 </tr>
+<tr>
+<td>TC-GM01</td>
+<td><code>list_messages</code></td>
+<td><code>tests/gmail.md</code></td>
+</tr>
+<tr>
+<td>TC-GM11</td>
+<td><code>send_message</code></td>
+<td><code>tests/gmail.md</code></td>
+</tr>
 </tbody>
 </table>
 <blockquote>
+<p><strong>Gmail rows:</strong> need an OAuth slot whose token has <code>gmail.modify</code> and the seeded fixture set (<code>setup.md</code> §"Gmail fixture setup"). Run <code>list_labels</code> on the slot first. If it returns the re-authorize error or <code>403 accessNotConfigured</code>, record both rows as <code>SKIP(no-gmail-scope)</code>, not FAIL: that's the slot's setup, not a regression. TC-GM11 sends only to a plus-address of the QA mailbox and trashes its message.</p>
 <p><strong>Note:</strong> TC-D152 appears in both <code>tests/drive_files.md</code> (<code>list_shared_with_me</code>) and <code>tests/docs_content.md</code> (<code>get_doc_structure</code>) due to a numbering conflict — see #201. Run both; they cover different tools. <code>get_doc_structure</code>'s own current numbering is actually <code>TC-DOC01</code> (renumbered per #201's resolution) — this row's <code>TC-D152</code> label appears to predate that renumbering and was already stale before this file split; not fixed here as it's a numbering-content question, not a file-organization one.</p>
 </blockquote>
 <hr />
