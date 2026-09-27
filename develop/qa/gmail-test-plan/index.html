@@ -1591,9 +1591,9 @@
 </tr>
 <tr>
 <td>GM29</td>
-<td><code>get_message</code></td>
-<td><code>large-body</code>: <code>body_plain</code> is non-null. <strong>Fails today, #825</strong>: Gmail delivers both 3 MB parts by <code>attachmentId</code>. Once fixed, expect the size-cap behavior #825 decides on, since 3 MB exceeds the default cap.</td>
-<td>read, known defect</td>
+<td><code>get_message</code>, <code>get_thread</code></td>
+<td><code>large-body</code> (Gmail delivers both 3 MB parts by <code>attachmentId</code>, #825). Without <code>local_path</code>: the size-cap error, naming <code>local_path</code>, since ~6 MB exceeds the default cap. With <code>local_path</code>: the written JSON has <code>body_plain</code> (3,000,002 chars) and <code>body_html</code> (3,037,987 chars) filled, <code>attachments: []</code>, no <code>body_fetch_errors</code>. Same for <code>get_thread</code> on its thread. Written as TC-GM30 in the #825 PR (the ID #830 renumbers this row to).</td>
+<td>read</td>
 </tr>
 <tr>
 <td>GM30</td>
@@ -1763,7 +1763,7 @@
 </tbody>
 </table>
 <p><strong>Live outcome (2026-09-26, <code>get_message</code> on <code>mcp-gee-sweet-oauth</code>, raw layout via the seed script's <code>inspect</code>):</strong>
-- <strong>P1 is confirmed and filed as #825.</strong> A ~3 MB body arrives by <code>attachmentId</code>, while a ~405 KB body still arrives inline.
+- <strong>P1 is confirmed and filed as #825.</strong> A ~3 MB body arrives by <code>attachmentId</code>, while a ~405 KB body still arrives inline. The #825 fix fetches it with <code>users.messages.attachments.get</code>, which returns the part's raw bytes in its declared charset, not the UTF-8 that inline <code>body.data</code> is transcoded to (confirmed live with a latin-1 and a Shift-JIS body).
 - <strong>P2 doesn't reproduce.</strong> Gmail puts the outer body first and the <code>message/rfc822</code> part after it.
 - <strong>P3 doesn't reproduce.</strong> Gmail stores the nameless inline image by <code>attachmentId</code>, so it's listed.</p>
 <p>P2 and P3 remain possible only for hand-built MIME, so they're unit-test material at most. P4–P9 are hardening tests. They can land together as one ticket.</p>
