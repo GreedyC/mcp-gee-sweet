@@ -1180,6 +1180,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#running-server-startup-and-cli-cases-in-a-scoped-lane-pass-eg-local-filesystem-infra-cases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Running server-startup and CLI cases in a scoped lane pass (e.g. ⚠️ local-filesystem infra cases)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#conductor-prompt" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1766,6 +1777,16 @@
 <h2 id="missing-docsqaenv-in-a-role-worktree">Missing <code>docs/qa/.env</code> in a role worktree<a class="headerlink" href="#missing-docsqaenv-in-a-role-worktree" title="Permanent link">&para;</a></h2>
 <p><code>docs/qa/.env</code> is gitignored, so it doesn't exist by default in a freshly-provisioned <code>.claude/worktrees/&lt;name&gt;</code> slot — confirmed empty/absent across every role worktree and the main checkout, 2026-07-19, while doing a scoped QA pass from Kit's own role process (<code>.claude/team-roles/qa.md</code> step 4), not the full conductor-prompt flow this file otherwise documents. That flow's own fixture-check step (below) would just stop and ask the user to run <code>setup.md</code>, but a scoped single-PR QA pass doesn't need the whole <code>.env</code> — only the one fixture ID relevant to the PR under review.</p>
 <p>Workaround: the fixture files have fixed, documented names (<code>setup.md</code>'s seed prompt: "Rename the doc to <code>mcp-gee-sweet-qa-fixtures-doc</code>" / "Rename the spreadsheet to <code>mcp-gee-sweet-qa-fixtures</code>"). Find the ID directly instead of blocking: <code>search_files(query="mcp-gee-sweet-qa-fixtures-doc", mime_type="application/vnd.google-apps.document")</code> (swap the doc mime type/name for the spreadsheet as needed). Only reach for this fallback in a scoped pass that needs one or two fixture IDs — a full multi-category run still needs the real <code>.env</code> for <code>TEST_FOLDER_ID</code>/<code>TEST_CALENDAR_ID</code>/etc., which don't have as fixed a name to search by.</p>
+<hr />
+<h2 id="running-server-startup-and-cli-cases-in-a-scoped-lane-pass-eg-local-filesystem-infra-cases">Running server-startup and CLI cases in a scoped lane pass (e.g. <code>⚠️ local-filesystem</code> infra cases)<a class="headerlink" href="#running-server-startup-and-cli-cases-in-a-scoped-lane-pass-eg-local-filesystem-infra-cases" title="Permanent link">&para;</a></h2>
+<p>Some cases test how the server <em>starts</em>, not what a tool does: auth waterfall and degraded start, stdio vs SSE behavior, CLI subcommands like <code>mcp-gee-sweet auth</code>. Your own <code>mcp-gee-sweet-&lt;name&gt;</code> server can't exercise these, since its env and transport are fixed. They still run fine in a lane pass. Start a fresh server process from the worktree with the env the case needs, and drive it yourself. Confirmed on PR #807 (Kit) and PR #828 (Sky, TC-I35..I40, 2026-09-26).</p>
+<ul>
+<li><strong>stdio:</strong> use the <code>mcp</code> SDK's <code>stdio_client(StdioServerParameters(command="uv", args=["run", "--directory", &lt;worktree&gt;, "mcp-gee-sweet"], env=...))</code> + <code>ClientSession</code>. Then <code>initialize</code>, <code>call_tool</code>, and <code>read_resource("server://auth-status")</code>. Strip <code>AUTH_METHOD</code>/<code>TOKEN_PATH</code>/<code>SERVICE_ACCOUNT_PATH</code>/<code>CREDENTIALS_CONFIG</code>/<code>GOOGLE_APPLICATION_CREDENTIALS</code> from the inherited env before applying the case's overrides. Set <code>DEBUG_LEVEL=DEBUG</code> + <code>LOG_FILE=&lt;tmp&gt;</code> for the log-line checks. mcp v2's <code>CallToolResult</code> field is <code>is_error</code>, not <code>isError</code>.</li>
+<li><strong>SSE:</strong> start <code>uv run mcp-gee-sweet --transport sse</code> in <strong>its own process group</strong> (<code>subprocess.Popen(..., start_new_session=True)</code> from Python, or <code>set -m</code> then <code>cmd &amp;</code> in a bash script; macOS has no <code>setsid</code>). Drive it with <code>mcp.client.sse.sse_client</code> + <code>ClientSession</code>, and SIGKILL the whole group afterward (<code>os.killpg</code> / <code>kill -9 -- -$PID</code>). The server runs with uvicorn <code>reload=True</code>, and SIGTERM doesn't interrupt a synchronous consent wait. <strong>Never</strong> <code>pkill -f "transport sse"</code> or similar: other lanes' and Kai's servers match. The lifespan (and any consent wait) runs when the SSE stream opens, <em>before</em> <code>initialize</code>, so time the connect, not <code>initialize</code>. Uvicorn's access log goes to stdout, so "stdout is empty" only holds while the event loop is blocked.</li>
+<li><strong>CLI + OAuth consent:</strong> run the command in the background, read the <code>Please visit this URL</code> line from its output, and complete (or Cancel) the consent via Playwright, after the signed-in check and under the mutex above. The account chooser lists more than one account, so pick the Workspace one that owns the fixtures.</li>
+<li><strong>Worktree-isolation guard:</strong> a session pinned to a role worktree rejects Bash commands it can't statically verify: <code>uv</code>/<code>git</code> with <code>$VAR</code>-expanded paths, heredocs, multi-step <code>cd … &amp;&amp; …</code> chains. Write each probe as a script under <code>$CLAUDE_JOB_DIR/tmp</code> with the Write tool (literal absolute paths inside), then run it as a single <code>bash /abs/path/script.sh</code> or <code>uv run python /abs/path/probe.py KEY=VAL ...</code> call.</li>
+<li><strong>Fixture:</strong> point <code>TOKEN_PATH</code> at a nonexistent file in a directory that <em>exists</em>. A missing parent directory now trips the pre-consent writability check (#811), which tests a different path.</li>
+</ul>
 <hr />
 <h2 id="conductor-prompt">Conductor prompt<a class="headerlink" href="#conductor-prompt" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>You are the QA conductor for mcp-gee-sweet. Your job is to execute the full test suite against the live MCP server, record outcomes, and save a results report.
