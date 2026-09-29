@@ -284,19 +284,108 @@ def rewrite_too_large_error(message: str) -> str:
     return message
 
 
+async def share_image_file(
+    drive_service,
+    file_id: str,
+    uri: str | None,
+    existing_permission_ids: list[str] | None,
+    *,
+    created_here: bool,
+) -> dict[str, Any]:
+    """Shares a Drive file anyone:reader so the Docs backend can fetch it — it fetches
+    inline images as an anonymous HTTP request regardless of the caller's own access
+    (confirmed live in #332/#333). The one share step every uploaded or drive:-sourced
+    image goes through (#511), so a change to its outcome shape can't miss a copy the
+    way #649's fix did.
+
+    `uri` is the file's webContentLink, which the caller already has from the call
+    that created or looked up the file: Drive returns it from create() and get()
+    alike, identical before and after sharing (confirmed live on #511), so no
+    separate files().get() is needed. A missing link fails before sharing, rather
+    than leaving an anyone:reader grant on a file nothing can embed.
+
+    `existing_permission_ids` is the file's permissionIds from that same call. Drive's
+    permissions.create() for an anyone grant that already exists returns the existing
+    grant's fixed ID (e.g. "anyoneWithLink") rather than a new one (confirmed live,
+    PR #842 QA round 1), so a returned ID already in that list means the file was
+    already public before this call: the result then carries "already_shared": True
+    and permission_id None, so nothing revokes a link someone else set up. This holds
+    for a freshly uploaded file too, which can inherit a folder's link sharing.
+    permissionIds, unlike the permissions field, is populated on Shared Drive items
+    (confirmed live, PR #842).
+
+    Returns {"uri", "file_id", "permission_id"} on success, else {"error": ...}. When
+    created_here is True — the caller just uploaded this file — the error also carries
+    "file_id", so the caller isn't left with an untracked orphan (#649, mirrors
+    #420's fix in drive/transfer.py). A pre-existing file (a drive: source) never
+    does: surfacing it in a failed-image outcome would let a caller with
+    orphan-reclaim logic delete a file it never made (PR #652 QA round 1)."""
+    orphan = {"file_id": file_id} if created_here else {}
+    if not uri:
+        return {"error": f"Drive returned no webContentLink for file {file_id!r}", **orphan}
+    try:
+        perm = await execute_in_thread(
+            drive_service.permissions()
+            .create(
+                fileId=file_id,
+                body={"type": "anyone", "role": "reader"},
+                supportsAllDrives=True,
+                fields="id",
+            )
+            .execute,
+            drive_service,
+        )
+    except Exception as e:
+        return {"error": f"sharing failed for Drive file {file_id!r}: {e}", **orphan}
+    permission_id = perm.get("id")
+    if permission_id in (existing_permission_ids or []):
+        return {"uri": uri, "file_id": file_id, "permission_id": None, "already_shared": True}
+    return {"uri": uri, "file_id": file_id, "permission_id": permission_id}
+
+
+async def revoke_image_shares(
+    drive_service, shares: list[tuple[dict[str, Any], str, str | None]]
+) -> None:
+    """Revokes each (outcome_entry, file_id, permission_id) temporary anyone:reader
+    grant, concurrently. On success sets entry["shared"] = False; on failure records
+    entry["revoke_error"]. A None permission_id — a grant that pre-existed this call
+    (share_image_file's already_shared) — is skipped, never revoked. Shared by
+    _apply_doc_content and insert_local_images (#511)."""
+
+    async def _revoke(entry: dict[str, Any], file_id: str, permission_id: str) -> None:
+        try:
+            await execute_in_thread(
+                drive_service.permissions()
+                .delete(fileId=file_id, permissionId=permission_id, supportsAllDrives=True)
+                .execute,
+                drive_service,
+            )
+            entry["shared"] = False
+        except Exception as e:
+            entry["revoke_error"] = str(e)
+
+    # return_exceptions=True: _revoke already catches its own errors; this only
+    # guards against anything unexpected escaping one revoke and skipping the rest.
+    await asyncio.gather(
+        *(_revoke(entry, fid, pid) for entry, fid, pid in shares if pid),
+        return_exceptions=True,
+    )
+
+
 async def upload_and_share_image(
     drive_service, data: bytes, mime_type: str, name: str, parent_folder_id: str | None
 ) -> dict[str, Any]:
     """Uploads `data` as a new Drive file and shares it anyone:reader — the same
     requirement every inline-image source needs, since the Docs backend fetches inline
     images as an anonymous HTTP request regardless of the caller's own access
-    (confirmed live in #332/#333's own local-image paths). Returns {"uri": ...,
-    "file_id": ..., "permission_id": ...} on success, {"error": ...} on failure before
+    (confirmed live in #332/#333's own local-image paths). Only ever called with
+    downscaled bytes, so its success result is share_image_file's plus
+    "downscaled": True — the one place every auto_downscale path (local file or
+    drive: source) gets the flag from, so no caller can drop it (PR #842 QA round 1).
+    Returns {"uri": ..., "file_id": ..., "permission_id": ...} on success, {"error": ...} on failure before
     any Drive file was created, or {"error": ..., "file_id": ...} if create() succeeded
-    but the follow-up sharing/metadata step failed — the latter mirrors
-    _resolve_image_source's own outcome shape and the create()+restamp fileId-
-    preserving pattern in drive/transfer.py (#420, #649): a bare error there would
-    leave the newly-created file an untracked orphan with no record of its ID."""
+    but share_image_file failed afterward (#649): a bare error there would leave the
+    newly-created file an untracked orphan with no record of its ID."""
     file_body: dict[str, Any] = {"name": name}
     if parent_folder_id:
         file_body["parents"] = [parent_folder_id]
@@ -304,7 +393,12 @@ async def upload_and_share_image(
     try:
         created = await execute_in_thread(
             drive_service.files()
-            .create(body=file_body, media_body=media, supportsAllDrives=True, fields="id")
+            .create(
+                body=file_body,
+                media_body=media,
+                supportsAllDrives=True,
+                fields="id,webContentLink,permissionIds",
+            )
             .execute,
             drive_service,
         )
@@ -315,41 +409,16 @@ async def upload_and_share_image(
     except Exception as e:
         return {"error": f"failed to upload resized image: {e}"}
 
-    new_file_id = created["id"]
-    try:
-        perm = await execute_in_thread(
-            drive_service.permissions()
-            .create(
-                fileId=new_file_id,
-                body={"type": "anyone", "role": "reader"},
-                supportsAllDrives=True,
-                fields="id",
-            )
-            .execute,
-            drive_service,
-        )
-        metadata = await execute_in_thread(
-            drive_service.files()
-            .get(fileId=new_file_id, fields="webContentLink", supportsAllDrives=True)
-            .execute,
-            drive_service,
-        )
-    except Exception as e:
-        # Unlike the create() failure above, a file now genuinely exists in Drive —
-        # only the sharing/metadata step failed. Surface file_id alongside the error
-        # so a caller can find and either fix or clean up the orphan (#649).
-        return {
-            "error": f"created Drive file {new_file_id!r} but failed to share it: {e}",
-            "file_id": new_file_id,
-        }
-
-    uri = metadata.get("webContentLink")
-    if not uri:
-        return {
-            "error": f"resized image {new_file_id} uploaded but Drive returned no webContentLink",
-            "file_id": new_file_id,
-        }
-    return {"uri": uri, "file_id": new_file_id, "permission_id": perm.get("id")}
+    result = await share_image_file(
+        drive_service,
+        created["id"],
+        created.get("webContentLink"),
+        created.get("permissionIds"),
+        created_here=True,
+    )
+    if "error" in result:
+        return result
+    return {**result, "downscaled": True}
 
 
 async def downscale_drive_file(
@@ -434,6 +503,58 @@ async def prepare_local_image(
     return await upload_and_share_image(
         drive_service, resized_bytes, mime_type, Path(path).name, folder_id
     )
+
+
+async def upload_and_share_local_image(
+    drive_service, path: str, folder_id: str, *, auto_downscale: bool
+) -> dict[str, Any]:
+    """Size-gates, uploads, and shares one local image file for embedding — the whole
+    local-path sequence insert_local_images and content.py's _resolve_image_source
+    both need (#511). Returns share_image_file's shape: {"uri", "file_id",
+    "permission_id"} on success (plus "downscaled": True if auto_downscale resized
+    it), else {"error": ...}, carrying "file_id" only for a created-but-unshared
+    orphan (#649) — including one _upload_local_file itself reports as fileId after
+    a create() that succeeded before a later step failed (#420)."""
+    prepared = await prepare_local_image(
+        drive_service, path, folder_id, auto_downscale=auto_downscale
+    )
+    if prepared is not None:
+        return prepared
+
+    upload = await _upload_local_file(
+        drive_service, path, folder_id, skip_if_exists=False, include_permission_ids=True
+    )
+    if "error" in upload:
+        error: dict[str, Any] = {"error": upload["error"]}
+        if orphan_id := upload.get("fileId"):
+            error["file_id"] = orphan_id
+        return error
+    return await share_image_file(
+        drive_service,
+        upload["fileId"],
+        upload.get("web_content_link"),
+        upload.get("permission_ids"),
+        created_here=True,
+    )
+
+
+def record_image_outcome(entry: dict[str, Any], result: dict[str, Any]) -> bool:
+    """Folds a share_image_file-shaped result into a caller-facing per-image outcome
+    entry: its file_id (the shared file, or a created-but-unshared orphan, #649) as
+    entry["fileId"], any error as entry["error"], and on success the "downscaled" and
+    "already_shared" flags. Returns True on success. The one place both
+    image-embedding tools record this (#511), so a field can't reach one tool's
+    outcome but not the other's — the drift PR #652's QA round caught for fileId and
+    PR #842's for downscaled."""
+    if file_id := result.get("file_id"):
+        entry["fileId"] = file_id
+    if "error" in result:
+        entry["error"] = result["error"]
+        return False
+    for flag in ("downscaled", "already_shared"):
+        if result.get(flag):
+            entry[flag] = True
+    return True
 
 
 def register(tool):
@@ -615,7 +736,10 @@ def register(tool):
                 configured default folder.
             revoke_sharing: Whether each image's temporary anyone:reader share is
                 revoked again after it's embedded (default True). Set False to leave
-                images shared instead — matches this tool's original behavior.
+                images shared instead — matches this tool's original behavior. A
+                file that was already link-shared before the call (e.g. inherited
+                from its folder) keeps its link and is reported with
+                already_shared: true.
             auto_downscale: Google Docs rejects any inline image over ~25 megapixels
                 or ~50MB. Each image's local file is checked against both limits
                 before it's ever uploaded. The default (False) fails just that image
@@ -628,7 +752,9 @@ def register(tool):
             Dictionary with docId and results — a list of per-image outcomes in the
             same order as the `images` argument, each echoing marker and local_path
             plus either fileId + index + shared (+ revoke_error if a revoke attempt
-            failed, + downscaled: true if auto_downscale resized it) on success, or
+            failed, + downscaled: true if auto_downscale resized it, +
+            already_shared: true if the file was link-shared before this call) on
+            success, or
             error on failure (marker not found, marker not unique, local file
             missing, oversized with auto_downscale off, upload failure, sharing
             failure, or — rare, since uploads happen first — a failed document edit;
@@ -725,89 +851,24 @@ def register(tool):
 
         async def _upload_and_share(placement: dict[str, Any]) -> None:
             entry = placement["entry"]
-            local_path = placement["local_path"]
-
-            result = await prepare_local_image(
-                drive_service, local_path, target_folder_id, auto_downscale=auto_downscale
+            result = await upload_and_share_local_image(
+                drive_service,
+                placement["local_path"],
+                target_folder_id,
+                auto_downscale=auto_downscale,
             )
-            if result is not None:
-                if "error" in result:
-                    entry["error"] = result["error"]
-                    placement["failed"] = True
-                    # A create()-succeeded-but-share-failed orphan (#649) still
-                    # carries file_id — propagate it so the cache-invalidation
-                    # check below still fires for it, mirroring the gap PR #645's
-                    # QA round found in transfer.py's analogous gates.
-                    orphan_file_id = result.get("file_id")
-                    if orphan_file_id:
-                        placement["file_id"] = orphan_file_id
-                        entry["fileId"] = orphan_file_id
-                    return
-                placement["file_id"] = result["file_id"]
-                placement["permission_id"] = result["permission_id"]
-                placement["uri"] = result["uri"]
-                entry["fileId"] = result["file_id"]
-                entry["downscaled"] = True
-                return
-
-            upload = await _upload_local_file(
-                drive_service, local_path, target_folder_id, skip_if_exists=False
-            )
-            if "error" in upload:
-                entry["error"] = upload["error"]
+            ok = record_image_outcome(entry, result)
+            # A created-but-unshared orphan (#649) still carries file_id: read it
+            # back from the entry so the cache-invalidation check below fires for
+            # it too (mirrors the gap PR #645's QA round found in transfer.py's
+            # analogous gates), from the same value the caller sees.
+            if "fileId" in entry:
+                placement["file_id"] = entry["fileId"]
+            if not ok:
                 placement["failed"] = True
                 return
-
-            file_id = upload["fileId"]
-            try:
-                perm = await execute_in_thread(
-                    drive_service.permissions()
-                    .create(
-                        fileId=file_id,
-                        body={"type": "anyone", "role": "reader"},
-                        supportsAllDrives=True,
-                        fields="id",
-                    )
-                    .execute,
-                    drive_service,
-                )
-                metadata = await execute_in_thread(
-                    drive_service.files()
-                    .get(fileId=file_id, fields="webContentLink", supportsAllDrives=True)
-                    .execute,
-                    drive_service,
-                )
-            except Exception as e:
-                # The file itself already uploaded successfully — only the
-                # sharing/metadata step failed. Carry file_id through so the
-                # cache-invalidation check below still fires and the caller isn't
-                # left with an untracked orphan (#649, mirrors #420's fix in
-                # drive/transfer.py).
-                entry["error"] = f"uploaded file {file_id!r} but failed to share it: {e}"
-                entry["fileId"] = file_id
-                placement["file_id"] = file_id
-                placement["failed"] = True
-                return
-
-            uri = metadata.get("webContentLink")
-            if not uri:
-                # Upload and share both succeeded — only the webContentLink
-                # read-back came up empty. The file is a real, created orphan;
-                # carry file_id through so the cache-invalidation gate below
-                # still fires and the caller can trace it (#649, same shape as
-                # the except branch above).
-                entry["error"] = (
-                    f"uploaded and shared as {file_id} but Drive returned no webContentLink"
-                )
-                entry["fileId"] = file_id
-                placement["file_id"] = file_id
-                placement["failed"] = True
-                return
-
-            placement["file_id"] = file_id
-            placement["permission_id"] = perm.get("id")
-            placement["uri"] = uri
-            entry["fileId"] = file_id
+            placement["permission_id"] = result["permission_id"]
+            placement["uri"] = result["uri"]
 
         if placements:
             # return_exceptions=True: _upload_and_share already catches its own
@@ -889,29 +950,13 @@ def register(tool):
             outcomes[placement["index"]] = entry
 
         if revoke_sharing:
-
-            async def _revoke(placement: dict[str, Any]) -> None:
-                try:
-                    await execute_in_thread(
-                        drive_service.permissions()
-                        .delete(
-                            fileId=placement["file_id"],
-                            permissionId=placement["permission_id"],
-                            supportsAllDrives=True,
-                        )
-                        .execute,
-                        drive_service,
-                    )
-                    placement["entry"]["shared"] = False
-                except Exception as e:
-                    placement["entry"]["revoke_error"] = str(e)
-
-            # return_exceptions=True: _revoke already catches its own errors, same
-            # rationale as the upload/share gather above. Runs regardless of
-            # doc_edit_error — an image that failed to embed was still genuinely
-            # uploaded and shared, so a failed embed must not skip cleanup of that
-            # real, temporary anyone:reader grant.
-            await asyncio.gather(*(_revoke(p) for p in ready), return_exceptions=True)
+            # Runs regardless of doc_edit_error — an image that failed to embed was
+            # still genuinely uploaded and shared, so a failed embed must not skip
+            # cleanup of that real, temporary anyone:reader grant.
+            await revoke_image_shares(
+                drive_service,
+                [(p["entry"], p["file_id"], p["permission_id"]) for p in ready],
+            )
 
         if doc_edit_error is None:
             lc.doc_cache.mark_dirty(doc_id)

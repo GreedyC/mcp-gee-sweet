@@ -15,7 +15,7 @@ from mcp.types import ToolAnnotations
 from ...auth import execute_in_thread
 from ...cache import CACHE_VALIDATE_MODIFIED_TIME
 from ..drive import _SA_QUOTA_ERROR
-from ..drive.transfer import _GOOGLE_DOC_MIME, _upload_local_file
+from ..drive.transfer import _GOOGLE_DOC_MIME
 from ..response_limits import enforce_response_size_cap, write_capped_result_to_disk
 from .anchors import compute_scheme_slugs, resolve_heading_anchor
 from .ast import Run, Table
@@ -24,8 +24,11 @@ from .html_parser import html_to_ast
 from .images import (
     check_drive_image_metadata,
     downscale_drive_file,
-    prepare_local_image,
+    record_image_outcome,
+    revoke_image_shares,
     rewrite_too_large_error,
+    share_image_file,
+    upload_and_share_local_image,
 )
 from .indices import _collect_doc_paragraphs, decode_code_run_text, utf16_len
 from .style import _add_or_clear_field
@@ -195,7 +198,8 @@ async def _resolve_image_source(
     local-path source uploads the resized bytes directly instead of the original file.
 
     Returns {"uri": ...} for an http(s) source, or {"uri": ..., "file_id": ...,
-    "permission_id": ...} for a drive:/local source — the permission_id is the
+    "permission_id": ...} for a drive:/local source (plus "downscaled": True for a
+    local file auto_downscale resized) — the permission_id is the
     just-granted anyone:reader permission, for the caller to revoke once the doc edit
     that actually embeds this image has succeeded (revoking any earlier would break the
     embed, since Docs fetches the image at insertion time, not upload time). Returns
@@ -210,12 +214,6 @@ async def _resolve_image_source(
     if src.startswith("http://") or src.startswith("https://"):
         return {"uri": src}
 
-    # True only once this call has itself uploaded a new local file — the single
-    # condition under which a later sharing failure leaves a real orphan worth
-    # reporting for cleanup (#649). A "drive:" source never sets it: that file
-    # pre-existed the call.
-    created_here = False
-
     if src.startswith("drive:"):
         file_id = src[len("drive:") :]
         if not file_id:
@@ -226,7 +224,7 @@ async def _resolve_image_source(
                 drive_service.files()
                 .get(
                     fileId=file_id,
-                    fields="name,parents,imageMediaMetadata,size",
+                    fields="name,parents,imageMediaMetadata,size,webContentLink,permissionIds",
                     supportsAllDrives=True,
                 )
                 .execute,
@@ -242,6 +240,15 @@ async def _resolve_image_source(
             return await downscale_drive_file(
                 drive_service, file_id, drive_metadata, target_folder_id
             )
+        # A "drive:" file pre-existed this call, so a sharing failure never reports
+        # it as an orphan (created_here=False) — see the docstring.
+        return await share_image_file(
+            drive_service,
+            file_id,
+            drive_metadata.get("webContentLink"),
+            drive_metadata.get("permissionIds"),
+            created_here=False,
+        )
     else:
         if not Path(src).is_file():
             return {"error": f"No file found at {src!r}"}
@@ -251,57 +258,9 @@ async def _resolve_image_source(
                 "(no server default folder configured)"
             }
 
-        prepared = await prepare_local_image(
+        return await upload_and_share_local_image(
             drive_service, src, target_folder_id, auto_downscale=auto_downscale
         )
-        if prepared is not None:
-            return prepared
-
-        upload = await _upload_local_file(
-            drive_service, src, target_folder_id, skip_if_exists=False
-        )
-        if "error" in upload:
-            return {"error": upload["error"]}
-        file_id = upload["fileId"]
-        created_here = True
-
-    try:
-        perm = await execute_in_thread(
-            drive_service.permissions()
-            .create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"},
-                supportsAllDrives=True,
-                fields="id",
-            )
-            .execute,
-            drive_service,
-        )
-        metadata = await execute_in_thread(
-            drive_service.files()
-            .get(fileId=file_id, fields="webContentLink", supportsAllDrives=True)
-            .execute,
-            drive_service,
-        )
-    except Exception as e:
-        err: dict[str, Any] = {"error": f"sharing failed for Drive file {file_id!r}: {e}"}
-        # Only a file this call just uploaded is an orphan worth reporting for
-        # cleanup (#649, mirrors #420's fix in drive/transfer.py). A "drive:"
-        # source is the caller's own pre-existing file — see the docstring.
-        if created_here:
-            err["file_id"] = file_id
-        return err
-
-    uri = metadata.get("webContentLink")
-    if not uri:
-        no_link: dict[str, Any] = {
-            "error": f"file {file_id} shared but Drive returned no webContentLink"
-        }
-        if created_here:
-            no_link["file_id"] = file_id
-        return no_link
-
-    return {"uri": uri, "file_id": file_id, "permission_id": perm.get("id")}
 
 
 async def _replace_doc_content(
@@ -415,7 +374,9 @@ async def _apply_doc_content(
 
     Returns the per-image outcome list (None if the content had no images at all)
     for the caller to fold into its own response — each entry has src, plus either
-    fileId + shared (+ revoke_error if a revoke attempt failed) on success, or error
+    fileId + shared (+ revoke_error if a revoke attempt failed, + downscaled if
+    auto_downscale resized it, + already_shared if the file was link-shared before
+    this call, so its link was left in place) on success, or error
     on failure (also carrying fileId if the underlying Drive file was already
     created/found before a subsequent sharing failure — #649). Mirrors
     insert_local_images's own outcome shape for consistency.
@@ -463,26 +424,22 @@ async def _apply_doc_content(
             entry: dict[str, Any] = {"src": img.src}
             if isinstance(result, BaseException):
                 entry["error"] = str(result)
-            elif "error" in result:
-                entry["error"] = result["error"]
-                # A create()-succeeded-but-share-failed orphan (#649) still carries
-                # file_id — surface it so the caller isn't left with no record of
-                # a Drive file that genuinely exists.
-                orphan_file_id = result.get("file_id")
-                if orphan_file_id:
-                    entry["fileId"] = orphan_file_id
-            else:
+            # record_image_outcome also surfaces a created-but-unshared orphan's
+            # file_id (#649), so the caller isn't left with no record of it.
+            elif record_image_outcome(entry, result):
                 img_id = id(img)
                 entry_by_id[img_id] = entry
                 real_uri_by_id[img_id] = result["uri"]
                 placeholder_uris[img_id] = f"urn:mcp-gee-sweet:pending-image:{img_id}"
                 file_id = result.get("file_id")
                 permission_id = result.get("permission_id")
-                if file_id:
-                    entry["fileId"] = file_id
                 if file_id and permission_id:
                     entry["shared"] = True
                     pending_revokes[img_id] = (entry, file_id, permission_id)
+                elif result.get("already_shared"):
+                    # Public before this call: still shared, and never revoked —
+                    # that link isn't this call's to remove (PR #842 QA round 1).
+                    entry["shared"] = True
             image_outcomes.append(entry)
 
     content_requests, tables = ast_to_requests(nodes, start_index=1, image_uris=placeholder_uris)
@@ -608,28 +565,7 @@ async def _apply_doc_content(
         await _resolve_heading_anchors(docs_service, doc_id)
 
     if pending_revokes and revoke_sharing:
-
-        async def _revoke(entry: dict[str, Any], file_id: str, permission_id: str) -> None:
-            try:
-                await execute_in_thread(
-                    drive_service.permissions()
-                    .delete(fileId=file_id, permissionId=permission_id, supportsAllDrives=True)
-                    .execute,
-                    drive_service,
-                )
-                entry["shared"] = False
-            except Exception as e:
-                entry["revoke_error"] = str(e)
-
-        # return_exceptions=True: _revoke already catches its own errors, same
-        # rationale as the resolution gather above.
-        await asyncio.gather(
-            *(
-                _revoke(entry, file_id, permission_id)
-                for entry, file_id, permission_id in pending_revokes.values()
-            ),
-            return_exceptions=True,
-        )
+        await revoke_image_shares(drive_service, list(pending_revokes.values()))
 
     return image_outcomes or None
 
@@ -850,7 +786,9 @@ def register(tool):
                 hyperlink (default True). Set False to leave bare URLs as plain text; to
                 suppress just one URL instead of the whole call, wrap it in backticks.
             revoke_sharing: Whether a local-path/drive: image's temporary anyone:reader
-                share is revoked again after it's embedded (default True).
+                share is revoked again after it's embedded (default True). An
+                image file that was already link-shared before the call keeps its
+                link and is reported with already_shared: true.
             auto_downscale: Resize an oversized local-path/drive: image instead of
                 failing it (default False). A drive: source gets a new " (resized)"
                 copy created alongside the original (left untouched); a local-path
@@ -969,7 +907,9 @@ def register(tool):
                 to suppress just one URL, wrap it in backticks instead. No effect on
                 .html files.
             revoke_sharing: Whether a local-path/drive: image's temporary anyone:reader
-                share is revoked again after it's embedded (default True).
+                share is revoked again after it's embedded (default True). An
+                image file that was already link-shared before the call keeps its
+                link and is reported with already_shared: true.
             auto_downscale: Resize an oversized local-path/drive: image instead of
                 failing it (default False) — see create_doc's own docstring.
 
@@ -1173,7 +1113,9 @@ def register(tool):
                 becomes a real hyperlink (default True). Set False to leave bare URLs as
                 plain text; to suppress just one URL, wrap it in backticks instead.
             revoke_sharing: Whether a local-path/drive: image's temporary anyone:reader
-                share is revoked again after it's embedded (default True).
+                share is revoked again after it's embedded (default True). An
+                image file that was already link-shared before the call keeps its
+                link and is reported with already_shared: true.
             auto_downscale: Resize an oversized local-path/drive: image instead of
                 failing it (default False) — see create_doc's own docstring.
 
@@ -1232,7 +1174,9 @@ def register(tool):
                 text; to suppress just one URL, wrap it in backticks instead. No
                 effect on HTML content.
             revoke_sharing: Whether a local-path/drive: image's temporary anyone:reader
-                share is revoked again after it's embedded (default True).
+                share is revoked again after it's embedded (default True). An
+                image file that was already link-shared before the call keeps its
+                link and is reported with already_shared: true.
             auto_downscale: Resize an oversized local-path/drive: image instead of
                 failing it (default False) — see create_doc's own docstring.
 

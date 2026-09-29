@@ -1226,12 +1226,10 @@ class TestResolveImageSource:
             "id": "uploaded1",
             "name": "pic.png",
             "webViewLink": "https://drive.google.com/file/d/uploaded1/view",
+            "webContentLink": "https://drive.google.com/uc?id=uploaded1",
         }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm2"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {
-            "webContentLink": "https://drive.google.com/uc?id=uploaded1"
         }
         result = await _resolve_image_source(drive_svc, str(img), "folder1")
         assert result == {
@@ -1239,10 +1237,15 @@ class TestResolveImageSource:
             "file_id": "uploaded1",
             "permission_id": "perm2",
         }
+        # #511: two Drive calls (create, share), no follow-up files().get().
+        drive_svc.files.return_value.get.assert_not_called()
 
     async def test_sharing_failure_is_error(self, tmp_path):
         drive_svc = MagicMock()
-        drive_svc.files.return_value.get.return_value.execute.return_value = {"name": "file1"}
+        drive_svc.files.return_value.get.return_value.execute.return_value = {
+            "name": "file1",
+            "webContentLink": "https://drive.google.com/uc?id=file1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
             "boom"
         )
@@ -1267,6 +1270,7 @@ class TestResolveImageSource:
             "id": "uploaded1",
             "name": "pic.png",
             "webViewLink": "https://drive.google.com/file/d/uploaded1/view",
+            "webContentLink": "https://drive.google.com/uc?id=uploaded1",
         }
         drive_svc.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
             "boom"
@@ -1278,9 +1282,6 @@ class TestResolveImageSource:
 
     async def test_missing_web_content_link_is_error(self):
         drive_svc = MagicMock()
-        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
-            "id": "perm1"
-        }
         drive_svc.files.return_value.get.return_value.execute.return_value = {}
         result = await _resolve_image_source(drive_svc, "drive:file1", "folder1")
         assert "error" in result
@@ -1288,11 +1289,13 @@ class TestResolveImageSource:
         # "drive:" source — no orphan created by this call, so no file_id (PR #652
         # QA round 1, finding 2).
         assert "file_id" not in result
+        # #511: nothing can embed a file with no link, so it's never shared.
+        drive_svc.permissions.return_value.create.assert_not_called()
 
     async def test_local_upload_missing_web_content_link_returns_orphan_file_id(self, tmp_path):
         # The local-upload counterpart to the drive: case above: the file was
-        # freshly uploaded, so a missing webContentLink read-back still leaves a
-        # real orphan whose id must be surfaced (#649).
+        # freshly uploaded, so a missing webContentLink still leaves a real orphan
+        # whose id must be surfaced (#649). Since #511 it fails before sharing.
         img = tmp_path / "pic.png"
         img.write_bytes(b"fake")
         drive_svc = MagicMock()
@@ -1302,14 +1305,11 @@ class TestResolveImageSource:
             "name": "pic.png",
             "webViewLink": "https://drive.google.com/file/d/uploaded1/view",
         }
-        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
-            "id": "perm2"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {}
         result = await _resolve_image_source(drive_svc, str(img), "folder1")
         assert "error" in result
         assert "webContentLink" in result["error"]
         assert result["file_id"] == "uploaded1"
+        drive_svc.permissions.return_value.create.assert_not_called()
 
     async def test_oversized_drive_image_fails_fast_without_sharing(self):
         drive_svc = MagicMock()
@@ -1356,15 +1356,15 @@ class TestResolveImageSource:
 
     async def test_oversized_drive_image_auto_downscale_creates_resized_copy(self):
         drive_svc = MagicMock()
-        drive_svc.files.return_value.get.return_value.execute.side_effect = [
-            {
-                "name": "big.png",
-                "parents": ["folder1"],
-                "imageMediaMetadata": {"width": 6000, "height": 6000},
-            },
-            {"webContentLink": "https://drive.google.com/uc?id=resized1"},
-        ]
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "resized1"}
+        drive_svc.files.return_value.get.return_value.execute.return_value = {
+            "name": "big.png",
+            "parents": ["folder1"],
+            "imageMediaMetadata": {"width": 6000, "height": 6000},
+        }
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "resized1",
+            "webContentLink": "https://drive.google.com/uc?id=resized1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm-resized"
         }
@@ -1390,6 +1390,7 @@ class TestResolveImageSource:
             "uri": "https://drive.google.com/uc?id=resized1",
             "file_id": "resized1",
             "permission_id": "perm-resized",
+            "downscaled": True,
         }
         create_kwargs = drive_svc.files.return_value.create.call_args.kwargs
         assert create_kwargs["body"]["name"] == "big.png (resized)"
@@ -1423,18 +1424,19 @@ class TestResolveImageSource:
         img = tmp_path / "big.png"
         img.write_bytes(_make_png_bytes(6000, 6000))
         drive_svc = MagicMock()
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "resized2"}
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "resized2",
+            "webContentLink": "https://drive.google.com/uc?id=resized2",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm-resized2"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {
-            "webContentLink": "https://drive.google.com/uc?id=resized2"
         }
         result = await _resolve_image_source(drive_svc, str(img), "folder1", auto_downscale=True)
         assert result == {
             "uri": "https://drive.google.com/uc?id=resized2",
             "file_id": "resized2",
             "permission_id": "perm-resized2",
+            "downscaled": True,
         }
         create_kwargs = drive_svc.files.return_value.create.call_args.kwargs
         assert create_kwargs["body"]["name"] == "big.png"
@@ -1501,6 +1503,54 @@ class TestCreateDocImages:
         drive_svc.permissions.return_value.delete.assert_called_once_with(
             fileId="file1", permissionId="perm1", supportsAllDrives=True
         )
+
+    async def test_drive_reference_already_link_shared_is_not_revoked(self):
+        # PR #842 QA round 1 F1 (reproduced live): share_file had already made the
+        # file anyoneWithLink; embedding it must not remove that link.
+        drive_svc, docs_svc = self._make_services()
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "anyoneWithLink"
+        }
+        drive_svc.files.return_value.get.return_value.execute.return_value = {
+            "webContentLink": "https://drive.google.com/uc?id=file1",
+            "permissionIds": ["owner1", "anyoneWithLink"],
+        }
+        ctx = self._ctx(drive_svc, docs_svc)
+        result = await _docs_tools["create_doc"](
+            title="Doc",
+            content="![Alt](drive:file1)",
+            content_format="markdown",
+            ctx=ctx,
+        )
+        assert result["images"] == [
+            {"src": "drive:file1", "fileId": "file1", "shared": True, "already_shared": True}
+        ]
+        drive_svc.permissions.return_value.delete.assert_not_called()
+
+    async def test_auto_downscaled_local_image_reports_downscaled(self, tmp_path):
+        # PR #842 QA round 1 F3 (reproduced live): insert_local_images reported
+        # downscaled for the same file; create_doc dropped it.
+        img = tmp_path / "big.png"
+        img.write_bytes(_make_png_bytes(6000, 6000))
+        drive_svc, docs_svc = self._make_services()
+        drive_svc.files.return_value.create.return_value.execute.side_effect = [
+            {"id": "doc123", "name": "Test", "parents": ["folder1"], "webViewLink": "x"},
+            {"id": "r1", "webContentLink": "https://drive.google.com/uc?id=r1"},
+        ]
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "perm1"
+        }
+        ctx = self._ctx(drive_svc, docs_svc, folder_id="folder1")
+        result = await _docs_tools["create_doc"](
+            title="Doc",
+            content=f"![Big]({img})",
+            content_format="markdown",
+            auto_downscale=True,
+            ctx=ctx,
+        )
+        assert result["images"] == [
+            {"src": str(img), "fileId": "r1", "shared": False, "downscaled": True}
+        ]
 
     async def test_revoke_sharing_false_leaves_image_shared(self):
         drive_svc, docs_svc = self._make_services()
@@ -1581,7 +1631,12 @@ class TestCreateDocImages:
         drive_svc.files.return_value.list.return_value.execute.return_value = {"files": []}
         drive_svc.files.return_value.create.return_value.execute.side_effect = [
             {"id": "doc123", "name": "Test", "parents": ["folder1"], "webViewLink": "x"},
-            {"id": "uploaded1", "name": "pic.png", "webViewLink": "y"},
+            {
+                "id": "uploaded1",
+                "name": "pic.png",
+                "webViewLink": "y",
+                "webContentLink": "https://drive.google.com/uc?id=uploaded1",
+            },
         ]
         drive_svc.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
             "boom"
@@ -1610,7 +1665,10 @@ class TestCreateDocImages:
         # logic keyed on "fileId in a failed outcome" could delete it (PR #652 QA
         # round 1, finding 2).
         drive_svc, docs_svc = self._make_services()
-        drive_svc.files.return_value.get.return_value.execute.return_value = {"name": "file1"}
+        drive_svc.files.return_value.get.return_value.execute.return_value = {
+            "name": "file1",
+            "webContentLink": "https://drive.google.com/uc?id=file1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
             "boom"
         )

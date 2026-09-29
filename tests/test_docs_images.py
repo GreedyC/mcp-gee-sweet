@@ -387,12 +387,12 @@ class TestRewriteTooLargeError:
 class TestUploadAndShareImage:
     async def test_success_returns_uri_file_id_permission_id(self):
         drive_svc = MagicMock()
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "new1"}
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "new1",
+            "webContentLink": "https://drive.google.com/uc?id=new1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm1"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {
-            "webContentLink": "https://drive.google.com/uc?id=new1"
         }
 
         result = await images.upload_and_share_image(
@@ -403,18 +403,23 @@ class TestUploadAndShareImage:
             "uri": "https://drive.google.com/uc?id=new1",
             "file_id": "new1",
             "permission_id": "perm1",
+            "downscaled": True,
         }
         create_kwargs = drive_svc.files.return_value.create.call_args.kwargs
         assert create_kwargs["body"] == {"name": "pic.png", "parents": ["folder1"]}
+        # #511: the link comes back from create() itself, so there's no follow-up
+        # files().get() round trip.
+        assert "webContentLink" in create_kwargs["fields"]
+        drive_svc.files.return_value.get.assert_not_called()
 
     async def test_no_parent_folder_omits_parents_key(self):
         drive_svc = MagicMock()
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "new1"}
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "new1",
+            "webContentLink": "https://drive.google.com/uc?id=new1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm1"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {
-            "webContentLink": "https://drive.google.com/uc?id=new1"
         }
 
         await images.upload_and_share_image(drive_svc, b"fake-bytes", "image/png", "pic.png", None)
@@ -440,19 +445,16 @@ class TestUploadAndShareImage:
     async def test_missing_web_content_link_is_error(self):
         drive_svc = MagicMock()
         drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "new1"}
-        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
-            "id": "perm1"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {}
 
         result = await images.upload_and_share_image(
             drive_svc, b"fake-bytes", "image/png", "pic.png", "folder1"
         )
         assert "error" in result
         assert "webContentLink" in result["error"]
-        # The file itself was already created — not an orphan-losing case, but the
-        # id should still be surfaced (#649).
+        # The file itself was already created — the id is still surfaced (#649).
         assert result["file_id"] == "new1"
+        # #511: nothing can embed a file with no link, so it's never shared.
+        drive_svc.permissions.return_value.create.assert_not_called()
 
     async def test_create_failure_returns_bare_error_no_file_id(self):
         # Nothing was created in this branch — there's no orphan to report, so
@@ -470,7 +472,10 @@ class TestUploadAndShareImage:
         # exists in Drive now, so the error must carry file_id (#649, mirrors #420's
         # fix in drive/transfer.py).
         drive_svc = MagicMock()
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "new1"}
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "new1",
+            "webContentLink": "https://drive.google.com/uc?id=new1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
             "share boom"
         )
@@ -482,11 +487,14 @@ class TestUploadAndShareImage:
         assert "share boom" in result["error"]
         assert "new1" in result["error"]
 
-    async def test_metadata_fetch_failure_after_create_returns_file_id(self):
-        # create() and permissions().create() both succeed but files().get() fails —
-        # same orphan-preserving shape as the sharing failure above (#649).
+    async def test_does_not_refetch_web_content_link(self):
+        # #511: before, a files().get() for webContentLink followed the share — a
+        # failing get() there would now be irrelevant, since it's never called.
         drive_svc = MagicMock()
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "new1"}
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "new1",
+            "webContentLink": "https://drive.google.com/uc?id=new1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm1"
         }
@@ -495,19 +503,321 @@ class TestUploadAndShareImage:
         result = await images.upload_and_share_image(
             drive_svc, b"fake-bytes", "image/png", "pic.png", "folder1"
         )
-        assert result["file_id"] == "new1"
-        assert "get boom" in result["error"]
+        assert result["uri"] == "https://drive.google.com/uc?id=new1"
+        drive_svc.files.return_value.get.assert_not_called()
+
+
+class TestShareImageFile:
+    """#511: the one share step every uploaded or drive:-sourced image goes through."""
+
+    async def test_success_uses_given_link_without_refetching(self):
+        drive_svc = MagicMock()
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "perm1"
+        }
+
+        result = await images.share_image_file(
+            drive_svc, "f1", "https://drive.google.com/uc?id=f1", ["owner1"], created_here=True
+        )
+
+        assert result == {
+            "uri": "https://drive.google.com/uc?id=f1",
+            "file_id": "f1",
+            "permission_id": "perm1",
+        }
+        drive_svc.permissions.return_value.create.assert_called_once_with(
+            fileId="f1",
+            body={"type": "anyone", "role": "reader"},
+            supportsAllDrives=True,
+            fields="id",
+        )
+        drive_svc.files.assert_not_called()
+
+    @pytest.mark.parametrize("created_here", [True, False])
+    async def test_missing_link_fails_before_sharing(self, created_here):
+        drive_svc = MagicMock()
+
+        result = await images.share_image_file(drive_svc, "f1", None, [], created_here=created_here)
+
+        assert "webContentLink" in result["error"]
+        assert ("file_id" in result) is created_here
+        drive_svc.permissions.return_value.create.assert_not_called()
+
+    @pytest.mark.parametrize("created_here", [True, False])
+    async def test_share_failure_reports_file_id_only_when_created_here(self, created_here):
+        drive_svc = MagicMock()
+        drive_svc.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
+            "boom"
+        )
+
+        result = await images.share_image_file(
+            drive_svc, "f1", "https://drive.google.com/uc?id=f1", [], created_here=created_here
+        )
+
+        assert result["error"] == "sharing failed for Drive file 'f1': boom"
+        assert result.get("file_id") == ("f1" if created_here else None)
+
+
+class TestShareImageFilePreexistingGrant:
+    """PR #842 QA round 1 F1: Drive's permissions.create() for an anyone grant that
+    already exists returns that grant's fixed ID, which used to be revoked as if this
+    call had created it — removing the caller's own public link."""
+
+    @pytest.mark.parametrize("created_here", [True, False])
+    async def test_returned_id_already_present_is_not_revocable(self, created_here):
+        drive_svc = MagicMock()
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "anyoneWithLink"
+        }
+
+        result = await images.share_image_file(
+            drive_svc,
+            "f1",
+            "https://drive.google.com/uc?id=f1",
+            ["owner1", "anyoneWithLink"],
+            created_here=created_here,
+        )
+
+        assert result == {
+            "uri": "https://drive.google.com/uc?id=f1",
+            "file_id": "f1",
+            "permission_id": None,
+            "already_shared": True,
+        }
+
+    async def test_new_grant_is_revocable(self):
+        drive_svc = MagicMock()
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "anyoneWithLink"
+        }
+
+        result = await images.share_image_file(
+            drive_svc, "f1", "https://drive.google.com/uc?id=f1", ["owner1"], created_here=False
+        )
+
+        assert result["permission_id"] == "anyoneWithLink"
+        assert "already_shared" not in result
+
+
+class TestUploadAndShareLocalImage:
+    """#511: the one local-path size-gate → upload → share sequence both
+    insert_local_images and _resolve_image_source go through."""
+
+    async def test_plain_upload_shares_with_create_time_link(self, tmp_path):
+        img = tmp_path / "small.png"
+        img.write_bytes(_make_png_bytes(10, 10))
+        drive_svc = MagicMock()
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "f1",
+            "name": "small.png",
+            "webContentLink": "https://drive.google.com/uc?id=f1",
+        }
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "perm1"
+        }
+
+        result = await images.upload_and_share_local_image(
+            drive_svc, str(img), "folder1", auto_downscale=False
+        )
+
+        assert result == {
+            "uri": "https://drive.google.com/uc?id=f1",
+            "file_id": "f1",
+            "permission_id": "perm1",
+        }
+        # Two Drive calls per image, not three: no follow-up files().get().
+        drive_svc.files.return_value.get.assert_not_called()
+
+    async def test_upload_failure_reports_no_file_id(self, tmp_path):
+        img = tmp_path / "small.png"
+        img.write_bytes(_make_png_bytes(10, 10))
+        drive_svc = MagicMock()
+        drive_svc.files.return_value.create.return_value.execute.side_effect = RuntimeError("boom")
+
+        result = await images.upload_and_share_local_image(
+            drive_svc, str(img), "folder1", auto_downscale=False
+        )
+
+        assert "error" in result
+        assert "file_id" not in result
+        drive_svc.permissions.return_value.create.assert_not_called()
+
+    async def test_share_failure_after_upload_reports_orphan_file_id(self, tmp_path):
+        img = tmp_path / "small.png"
+        img.write_bytes(_make_png_bytes(10, 10))
+        drive_svc = MagicMock()
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "f1",
+            "webContentLink": "https://drive.google.com/uc?id=f1",
+        }
+        drive_svc.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
+            "boom"
+        )
+
+        result = await images.upload_and_share_local_image(
+            drive_svc, str(img), "folder1", auto_downscale=False
+        )
+
+        assert "sharing failed" in result["error"]
+        assert result["file_id"] == "f1"
+
+    async def test_auto_downscaled_upload_is_flagged(self, tmp_path):
+        img = tmp_path / "big.png"
+        img.write_bytes(_make_png_bytes(6000, 6000))
+        drive_svc = MagicMock()
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "r1",
+            "webContentLink": "https://drive.google.com/uc?id=r1",
+        }
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "perm1"
+        }
+
+        result = await images.upload_and_share_local_image(
+            drive_svc, str(img), "folder1", auto_downscale=True
+        )
+
+        assert result["downscaled"] is True
+        assert result["file_id"] == "r1"
+
+    async def test_oversized_without_auto_downscale_errors_before_upload(self, tmp_path):
+        img = tmp_path / "big.png"
+        img.write_bytes(_make_png_bytes(6000, 6000))
+        drive_svc = MagicMock()
+
+        result = await images.upload_and_share_local_image(
+            drive_svc, str(img), "folder1", auto_downscale=False
+        )
+
+        assert "error" in result
+        assert "downscaled" not in result
+        drive_svc.files.return_value.create.assert_not_called()
+
+
+class TestUploadAndShareLocalImageRound1:
+    """PR #842 QA round 1."""
+
+    async def test_upload_error_carrying_file_id_keeps_it_as_orphan(self, tmp_path):
+        # F2: a create()-succeeded-but-restamp-failed upload (#420) reports fileId.
+        img = tmp_path / "small.png"
+        img.write_bytes(_make_png_bytes(10, 10))
+        with patch.object(
+            images,
+            "_upload_local_file",
+            return_value={"error": "restamp boom", "fileId": "orphan1"},
+        ):
+            result = await images.upload_and_share_local_image(
+                MagicMock(), str(img), "folder1", auto_downscale=False
+            )
+
+        assert result == {"error": "restamp boom", "file_id": "orphan1"}
+
+    async def test_requests_permission_ids_and_passes_them_to_share(self, tmp_path):
+        # F1: an upload that inherited its folder's link sharing isn't revoked.
+        img = tmp_path / "small.png"
+        img.write_bytes(_make_png_bytes(10, 10))
+        drive_svc = MagicMock()
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "f1",
+            "webContentLink": "https://drive.google.com/uc?id=f1",
+            "permissionIds": ["owner1", "anyoneWithLink"],
+        }
+        drive_svc.permissions.return_value.create.return_value.execute.return_value = {
+            "id": "anyoneWithLink"
+        }
+
+        result = await images.upload_and_share_local_image(
+            drive_svc, str(img), "folder1", auto_downscale=False
+        )
+
+        assert "permissionIds" in drive_svc.files.return_value.create.call_args.kwargs["fields"]
+        assert result["already_shared"] is True
+        assert result["permission_id"] is None
+
+
+class TestRecordImageOutcome:
+    """#511: the one place a per-image outcome entry records file_id/error."""
+
+    def test_success_records_file_id(self):
+        entry: dict = {}
+        assert images.record_image_outcome(entry, {"uri": "u", "file_id": "f1"}) is True
+        assert entry == {"fileId": "f1"}
+
+    def test_success_without_file_id_records_nothing(self):
+        entry: dict = {}
+        assert images.record_image_outcome(entry, {"uri": "https://x/y.png"}) is True
+        assert entry == {}
+
+    def test_error_with_orphan_records_both(self):
+        entry: dict = {}
+        assert images.record_image_outcome(entry, {"error": "boom", "file_id": "f1"}) is False
+        assert entry == {"fileId": "f1", "error": "boom"}
+
+    def test_error_without_orphan_records_only_error(self):
+        entry: dict = {}
+        assert images.record_image_outcome(entry, {"error": "boom"}) is False
+        assert entry == {"error": "boom"}
+
+
+class TestRecordImageOutcomeFlags:
+    def test_success_copies_downscaled_and_already_shared(self):
+        entry: dict = {}
+        result = {"uri": "u", "file_id": "f1", "downscaled": True, "already_shared": True}
+        assert images.record_image_outcome(entry, result) is True
+        assert entry == {"fileId": "f1", "downscaled": True, "already_shared": True}
+
+    def test_error_does_not_copy_flags(self):
+        entry: dict = {}
+        result = {"error": "boom", "file_id": "f1", "downscaled": True}
+        assert images.record_image_outcome(entry, result) is False
+        assert entry == {"fileId": "f1", "error": "boom"}
+
+
+class TestRevokeImageShares:
+    async def test_revokes_each_share_and_records_per_entry_outcome(self):
+        drive_svc = MagicMock()
+
+        def delete(fileId, permissionId, supportsAllDrives):
+            req = MagicMock()
+            if fileId == "bad":
+                req.execute.side_effect = RuntimeError("revoke boom")
+            return req
+
+        drive_svc.permissions.return_value.delete.side_effect = delete
+        ok_entry: dict = {"shared": True}
+        bad_entry: dict = {"shared": True}
+
+        await images.revoke_image_shares(
+            drive_svc, [(ok_entry, "good", "perm-good"), (bad_entry, "bad", "perm-bad")]
+        )
+
+        assert ok_entry == {"shared": False}
+        assert bad_entry == {"shared": True, "revoke_error": "revoke boom"}
+        assert drive_svc.permissions.return_value.delete.call_count == 2
+
+    async def test_none_permission_id_is_skipped(self):
+        # F7: a pre-existing grant (share_image_file's already_shared) is never revoked.
+        drive_svc = MagicMock()
+        entry: dict = {"shared": True, "already_shared": True}
+        await images.revoke_image_shares(drive_svc, [(entry, "f1", None)])
+        drive_svc.permissions.return_value.delete.assert_not_called()
+        assert entry == {"shared": True, "already_shared": True}
+
+    async def test_empty_list_makes_no_calls(self):
+        drive_svc = MagicMock()
+        await images.revoke_image_shares(drive_svc, [])
+        drive_svc.permissions.assert_not_called()
 
 
 class TestDownscaleDriveFile:
     async def test_success_uploads_resized_copy_with_suffixed_name(self):
         drive_svc = MagicMock()
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "resized1"}
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "resized1",
+            "webContentLink": "https://drive.google.com/uc?id=resized1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm1"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {
-            "webContentLink": "https://drive.google.com/uc?id=resized1"
         }
 
         png_bytes = _png_bytes(6000, 6000)
@@ -531,6 +841,7 @@ class TestDownscaleDriveFile:
             "uri": "https://drive.google.com/uc?id=resized1",
             "file_id": "resized1",
             "permission_id": "perm1",
+            "downscaled": True,
         }
         create_kwargs = drive_svc.files.return_value.create.call_args.kwargs
         assert create_kwargs["body"]["name"] == "logo.png (resized)"
@@ -867,16 +1178,16 @@ class TestInsertInlineImage:
 
     async def test_oversized_drive_image_auto_downscale_inserts_resized_copy(self):
         drive_svc = MagicMock()
-        drive_svc.files.return_value.get.return_value.execute.side_effect = [
-            {
-                "name": "big.png",
-                "parents": ["folder1"],
-                "webContentLink": "https://drive.google.com/uc?id=file1",
-                "imageMediaMetadata": {"width": 6000, "height": 6000},
-            },
-            {"webContentLink": "https://drive.google.com/uc?id=resized1"},
-        ]
-        drive_svc.files.return_value.create.return_value.execute.return_value = {"id": "resized1"}
+        drive_svc.files.return_value.get.return_value.execute.return_value = {
+            "name": "big.png",
+            "parents": ["folder1"],
+            "webContentLink": "https://drive.google.com/uc?id=file1",
+            "imageMediaMetadata": {"width": 6000, "height": 6000},
+        }
+        drive_svc.files.return_value.create.return_value.execute.return_value = {
+            "id": "resized1",
+            "webContentLink": "https://drive.google.com/uc?id=resized1",
+        }
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "perm-resized"
         }
@@ -954,16 +1265,17 @@ class TestInsertLocalImages:
     ):
         drive_svc = MagicMock()
         drive_svc.files.return_value.list.return_value.execute.return_value = {"files": []}
-        drive_svc.files.return_value.create.return_value.execute.return_value = {
+        created = {
             "id": file_id,
             "name": "pic.png",
             "webViewLink": "https://drive.google.com/file/d/x/view",
         }
+        # #511: the upload's own create() returns webContentLink; nothing re-fetches it.
+        if web_content_link is not None:
+            created["webContentLink"] = web_content_link
+        drive_svc.files.return_value.create.return_value.execute.return_value = created
         drive_svc.permissions.return_value.create.return_value.execute.return_value = {
             "id": "anyoneWithLink"
-        }
-        drive_svc.files.return_value.get.return_value.execute.return_value = {
-            "webContentLink": web_content_link
         }
         return drive_svc
 
@@ -1026,6 +1338,30 @@ class TestInsertLocalImages:
         assert "error" in result["results"][0]
         assert "unique" in result["results"][0]["error"]
 
+    async def test_already_link_shared_upload_keeps_its_link(self, tmp_path):
+        # PR #842 QA round 1 F1: an upload that inherited its folder's link sharing
+        # is still embedded, but the pre-existing grant isn't revoked.
+        img = tmp_path / "pic.png"
+        img.write_bytes(b"fake")
+        doc, _ = _build_doc_body([["before\n"], ["MARKER\n"], ["after\n"]])
+        docs_svc = self._docs_svc(doc)
+        drive_svc = self._drive_svc(file_id="img1")
+        drive_svc.files.return_value.create.return_value.execute.return_value["permissionIds"] = [
+            "owner1",
+            "anyoneWithLink",
+        ]
+        ctx = self._ctx(docs_svc=docs_svc, drive_svc=drive_svc, folder_id="folder1")
+
+        result = await _docs_tools["insert_local_images"](
+            doc_id="doc1", images=[{"marker": "MARKER", "local_path": str(img)}], ctx=ctx
+        )
+
+        entry = result["results"][0]
+        assert entry["shared"] is True
+        assert entry["already_shared"] is True
+        assert "error" not in entry
+        drive_svc.permissions.return_value.delete.assert_not_called()
+
     async def test_successful_single_image_places_and_deletes_marker(self, tmp_path):
         img = tmp_path / "pic.png"
         img.write_bytes(b"fake")
@@ -1065,6 +1401,8 @@ class TestInsertLocalImages:
             permissionId="anyoneWithLink",
             supportsAllDrives=True,
         )
+        # #511: two Drive calls per image (create, share), not three.
+        drive_svc.files.return_value.get.assert_not_called()
 
         body = docs_svc.documents.return_value.batchUpdate.call_args.kwargs["body"]
         image_req = body["requests"][0]["insertInlineImage"]
@@ -1168,14 +1506,12 @@ class TestInsertLocalImages:
         # mirrors PR #645's cache-invalidation-gate fix for the same shape).
         drive_folder_cache.mark_dirty.assert_called_once_with("folder1")
 
-    async def test_missing_web_content_link_after_share_still_reports_orphan_file_id(
-        self, tmp_path
-    ):
-        # The second post-upload failure branch: upload AND share both succeeded,
-        # but the webContentLink read-back came up empty. The file is still a
-        # real, created orphan — fileId must be surfaced and the folder cache
-        # marked dirty, same as the sharing-exception branch above (PR #652 QA
-        # round 1, finding 1).
+    async def test_missing_web_content_link_reports_orphan_file_id_without_sharing(self, tmp_path):
+        # The second post-upload failure branch: the upload succeeded but Drive
+        # returned no webContentLink for it. The file is still a real, created
+        # orphan — fileId must be surfaced and the folder cache marked dirty, same
+        # as the sharing-exception branch above (PR #652 QA round 1, finding 1).
+        # Since #511 it fails before sharing, so no anyone:reader grant is left.
         img = tmp_path / "pic.png"
         img.write_bytes(b"fake")
         doc, _ = _build_doc_body([["MARKER\n"]])
@@ -1196,6 +1532,7 @@ class TestInsertLocalImages:
         assert result["results"][0]["fileId"] == "img1"
         drive_folder_cache.mark_dirty.assert_called_once_with("folder1")
         docs_svc.documents.return_value.batchUpdate.assert_not_called()
+        drive_svc.permissions.return_value.create.assert_not_called()
 
     async def test_marks_caches_dirty_on_success(self, tmp_path):
         img = tmp_path / "pic.png"

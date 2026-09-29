@@ -3483,10 +3483,10 @@ Mirrors #420's fix in `drive/transfer.py` (see TC-D249/TC-D250 in `docs/qa/tests
 
 **Checks (unit test)**
 - `tests/test_docs_images.py::TestUploadAndShareImage::test_share_failure_after_create_returns_file_id` — `create()` succeeds, `permissions().create()` raises → result carries `file_id` alongside `error`
-- `tests/test_docs_images.py::TestUploadAndShareImage::test_metadata_fetch_failure_after_create_returns_file_id` — `create()` and `permissions().create()` succeed, `files().get()` raises → result still carries `file_id`
+- ~~`tests/test_docs_images.py::TestUploadAndShareImage::test_metadata_fetch_failure_after_create_returns_file_id`~~ — removed by #511: the post-share `files().get()` it exercised no longer exists (the link now comes back from `create()`); `test_does_not_refetch_web_content_link` guards that instead
 - `tests/test_docs_images.py::TestUploadAndShareImage::test_create_failure_returns_bare_error_no_file_id` — regression guard: when `create()` itself fails, no `file_id` key at all (nothing was created, so there's no orphan)
 - `tests/test_docs_images.py::TestInsertLocalImages::test_sharing_failure_reports_per_image_error_and_skips_doc_edit` (updated) and `test_downscaled_upload_share_failure_still_reports_file_id` (new) — both of `insert_local_images`'s upload paths (plain and auto_downscale) surface `fileId` in the per-image outcome entry on a sharing failure
-- `tests/test_docs_images.py::TestInsertLocalImages::test_missing_web_content_link_after_share_still_reports_orphan_file_id` (new, PR #652 QA round 1 finding 1) — `insert_local_images`'s plain path's *second* post-upload failure branch (`if not uri:` — upload and share both succeeded, webContentLink read-back empty) also surfaces `fileId` in the per-image outcome and still marks the folder cache dirty
+- `tests/test_docs_images.py::TestInsertLocalImages::test_missing_web_content_link_reports_orphan_file_id_without_sharing` (new, PR #652 QA round 1 finding 1) — `insert_local_images`'s plain path's *second* post-upload failure branch (`if not uri:` — the upload succeeded but Drive returned no webContentLink; since #511 this fails *before* sharing) also surfaces `fileId` in the per-image outcome and still marks the folder cache dirty
 - `tests/test_docs_images.py::TestInsertLocalImages::test_sharing_failure_orphan_still_marks_folder_cache_dirty` / `test_downscaled_upload_share_failure_still_reports_file_id` (cache assertion) — the folder-listing cache is still marked dirty for the orphan case, mirroring the cache-invalidation-gate fix PR #645's QA round found necessary for the identical shape in `transfer.py`
 - `tests/test_docs_content.py::TestResolveImageSource::test_local_upload_sharing_failure_returns_orphan_file_id` (new) — a local-path source's sharing failure (the true orphan case — the file was freshly created by this call) carries `file_id`
 - `tests/test_docs_content.py::TestResolveImageSource::test_local_upload_missing_web_content_link_returns_orphan_file_id` (new) — same local-path source, the missing-`webContentLink` branch, also carries `file_id`
@@ -3729,3 +3729,90 @@ Tool call: `insert_local_images(doc_id={DOC_ID}, images=[{"marker": "IMGMARKERBO
 **Cleanup:** trash the doc; `chmod 644 /tmp/qa-noread.png && rm /tmp/qa-noread.png`
 
 **Result (2026-09-24) ✅ PASS — Kit, PR #801 round 2 (fix `4d5f842`, issue #560).** The error text matched exactly, with no `fileId` and nothing uploaded. (Round 1 reproduced the pre-fix behavior locally: `prepare_local_image` returned `None` and the file went on to the upload.) Doc trashed.
+
+---
+
+### TC-DOC199: Image embedding shares through one helper and makes two Drive calls per uploaded image, not three (issue #511) ⚠️ requires-oauth ⚠️ destructive
+
+**Background:** #511 consolidated three hand-copied share blocks (`upload_and_share_image`, `insert_local_images`'s plain upload path, `_resolve_image_source`) into `images.py`'s `share_image_file`, the two revoke closures (`_apply_doc_content`, `insert_local_images`) into `revoke_image_shares`, the local-path size-gate → upload → share sequence both `create_doc`'s image resolution and `insert_local_images` ran into `upload_and_share_local_image`, and the per-image `fileId`/`error` fold (including the #649 orphan `fileId` whose hand-copied drift PR #652's QA round caught) into `record_image_outcome` (which also carries `downscaled`/`already_shared` into the outcome entry — see TC-DOC200/TC-DOC201). Each copy used to follow its `permissions().create()` with a `files().get()` just to read `webContentLink`. That field now comes back from the call that created or looked up the file (confirmed live on #511: `create()` returns it, identical to the post-share value), so each uploaded image takes two Drive calls instead of three. Nothing about the tools' outputs should change except:
+- Every sharing-failure message now reads `sharing failed for Drive file '<id>': ...` (the wording `create_doc`'s local/`drive:` path already used). Changed: `insert_local_images`' plain upload (was `uploaded file '<id>' but failed to share it: ...`) and every auto_downscale resized upload — `insert_local_images`, `create_doc`/`create_doc_from_file`/`write_doc_content`/`update_doc_from_file`, and `insert_inline_image`'s `drive_file_id` path (was `created Drive file '<id>' but failed to share it: ...`).
+- Every missing-`webContentLink` message now reads `Drive returned no webContentLink for file '<id>'`, and fails *before* sharing. Was: `file <id> shared but Drive returned no webContentLink` (`create_doc` family), `uploaded and shared as <id> but Drive returned no webContentLink` (`insert_local_images`), `resized image <id> uploaded but Drive returned no webContentLink` (auto_downscale resized uploads).
+- `upload_local_file`'s response gains `web_content_link` (TC-D93).
+- `create_doc` and its siblings now report `downscaled: true` like `insert_local_images` does (TC-DOC201), and an image file that was already link-shared keeps its link (`already_shared: true`, TC-DOC200) in both tools.
+
+These messages are only reachable through injected Drive failures, so they're covered by unit tests, not live. The Drive call count isn't visible through the tools, so it's covered by unit tests.
+
+**Action (live regression — the outcomes these paths produce are unchanged)**
+1. Run TC-DOC150 (`create_doc`, local-path image, revoke by default)
+2. Run TC-DOC151 (`create_doc`, `drive:` image, `revoke_sharing=False`)
+3. Run TC-DOC152 (`insert_local_images`, revoke by default)
+4. Run TC-DOC165 (`insert_local_images`, `auto_downscale=True`)
+
+**Checks**
+- Each case above passes exactly as written: images embed, `shared` and `list_permissions` match the case's revoke setting, and there's no `revoke_error`
+- Unit tests: `tests/test_docs_images.py::TestShareImageFile` (success without a `files()` call; missing link fails before sharing; `file_id` on a failure only when `created_here`), `TestRevokeImageShares` (per-entry `shared`/`revoke_error`), `TestUploadAndShareLocalImage` (two Drive calls, orphan `file_id` only after a successful upload, `downscaled` flag), `TestRecordImageOutcome`/`TestRecordImageOutcomeFlags`, `TestUploadAndShareImage::test_success_returns_uri_file_id_permission_id` and `TestInsertLocalImages::test_successful_single_image_places_and_deletes_marker` (no `files().get()`), `tests/test_docs_content.py::TestResolveImageSource::test_local_path_uploaded_shared_and_resolved` (no `files().get()`), and `tests/drive/test_transfer.py::TestUploadLocalFileCore::test_returns_web_content_link_when_drive_provides_it`
+
+**Cleanup:** per each referenced case
+
+**Result (2026-09-28) ❌ FAIL — Kit, PR #842 round 1 (`5604534`, issue #511).** API checks for all four referenced cases passed, and the 520 unit tests in the touched test files pass. Two defects were confirmed live, so this goes back to Dev. Playwright didn't connect this session, so the visual checks are pending for round 2.
+- TC-DOC150: `images=[{fileId, shared: false}]`, no `revoke_error`; `list_permissions` shows no `anyone` grant.
+- TC-DOC151: `images=[{src: "drive:<id>", fileId: <id>, shared: true}]`; `anyone`/`reader` still present.
+- TC-DOC152: `results[0]` has `fileId`, `index` 9, `shared: false`, no `revoke_error`; no `anyone` grant.
+- TC-DOC165: `fileId`, `downscaled: true`, `shared: false`, `index` 1 = the marker's `startIndex`; uploaded name unsuffixed `qa-oversized.png`.
+- ❌ **Pre-existing public link revoked (code-review F1, pre-existing on `develop`, but it lives in the new `share_image_file`).** The file already had the user's own `anyoneWithLink` reader grant (set with `share_file`). `create_doc(content="![Pixel](drive:<id>)")` with the default `revoke_sharing=True` returned `shared: false`, and `list_permissions` afterward showed the `anyone` grant **gone**. Drive's `permissions.create` returns the existing fixed-ID `anyoneWithLink` permission, and the revoke then deletes it.
+- ❌ **`create_doc` drops `downscaled` (code-review F3).** `create_doc(content="![Big](/tmp/qa-oversized.png)", auto_downscale=True)` resized and embedded the image, but `images[0]` had no `downscaled` key. `insert_local_images` reports `downscaled: true` for the same file (TC-DOC165 above).
+All docs, uploads, and grants were trashed or removed.
+
+**Result (2026-09-28) ✅ PASS — Kit, PR #842 round 2 (`07e5139`).** All six round-1 findings are fixed. F1 and F3 were re-verified live via TC-DOC200/TC-DOC201 above. F2/F4/F5/F6/F7 were checked in the fix diff, and the full unit suite passes (1900 passed, 3 skipped). Regression cases on the new code:
+- TC-DOC150: `shared: false`, no `anyone` grant. Playwright: the pixel dot renders between "Report" and "After the image."
+- TC-DOC151: `shared: true`, and `anyoneWithLink` is still present with `revoke_sharing=False`. Embed confirmed via `get_doc_as_markdown`.
+- TC-DOC152: `fileId`, `index` 9, `shared: false`, no `anyone` grant. Embed confirmed via `get_doc_as_markdown` (`Marker: ![](…)`).
+- TC-DOC165: `downscaled: true`, `shared: false`, `index` 1. Playwright: the red image renders where the marker was.
+All artifacts trashed.
+
+---
+
+### TC-DOC200: Embedding an image that's already link-shared leaves its link in place (PR #842 QA round 1) ⚠️ requires-oauth ⚠️ destructive
+
+**Background:** Drive's `permissions.create()` for an `anyone` grant that already exists returns that grant's fixed ID (`anyoneWithLink`) instead of creating a new one. Before this fix, the default `revoke_sharing=True` then deleted it, removing a public link the user had set up themselves. `share_image_file` now compares the returned ID against the file's `permissionIds` from the same `get()`/`create()` call and never revokes a grant that was already there.
+
+**Setup:** `upload_local_file(local_path="<repo-root>/docs/qa/fixtures/qa-fixture-pixel.png", parent_folder_id={FOLDER_ID})` → note `fileId` as `{PIXEL_ID}`; then `share_file(file_id={PIXEL_ID}, permissions=[{"type": "anyone", "role": "reader"}], send_notification=False)`
+
+**Prompt**
+**Playwright: required**
+> "Create a Google Doc titled 'TC-DOC200' in folder {FOLDER_ID} from this markdown: `![Pixel](drive:{PIXEL_ID})`"
+
+Tool call: `create_doc(title="TC-DOC200", content="![Pixel](drive:{PIXEL_ID})", content_format="markdown", folder_id={FOLDER_ID})`
+
+**Checks**
+- Response has no `error`; `images` is `[{"src": "drive:{PIXEL_ID}", "fileId": "{PIXEL_ID}", "shared": true, "already_shared": true}]`, with no `revoke_error`
+- `list_permissions(file_id={PIXEL_ID})` still shows the `anyone`/`reader` grant (the regression: it used to be gone)
+- Control: `create_doc(title="TC-DOC200b", content="![Pixel](drive:{PIXEL_ID})", content_format="markdown", folder_id={FOLDER_ID})` after `remove_permission(file_id={PIXEL_ID}, permission_id="anyoneWithLink")` returns `shared: false` with no `already_shared`, and `list_permissions` shows no `anyone` grant (a grant this call created is still revoked)
+- 🔍 Visual check: the pixel image renders in TC-DOC200
+
+**Cleanup:** trash both docs and `{PIXEL_ID}`
+
+
+**Result (2026-09-28) ✅ PASS — Kit, PR #842 round 2 (`07e5139`).** With `anyoneWithLink` already set via `share_file`: `images=[{src, fileId, already_shared: true, shared: true}]`, no `revoke_error`. `list_permissions` still shows `anyoneWithLink`: the round-1 regression is fixed. Control (after `remove_permission`): TC-DOC200b returned `shared: false` with no `already_shared`, and no `anyone` grant remained. Embed confirmed via `get_doc_as_markdown` (`![](…)`). The 1×1 pixel sits under the cursor at index 1, so a screenshot can't show it. Docs and pixel trashed.
+
+---
+
+### TC-DOC201: `create_doc` reports `downscaled` for an auto-downscaled image (PR #842 QA round 1) ⚠️ requires-oauth ⚠️ destructive
+
+**Background:** `insert_local_images` reported `downscaled: true` for a resized image; `create_doc` resized and embedded the same file but dropped the flag. Both now record outcomes through `record_image_outcome`.
+
+**Setup:** create the oversized fixture as in TC-DOC162: `uv run python3 -c "from PIL import Image; Image.new('RGB', (6000, 6000), 'red').save('/tmp/qa-oversized.png')"`
+
+**Prompt**
+**Playwright: required**
+> "Create a Google Doc titled 'TC-DOC201' in folder {FOLDER_ID} from this markdown, auto-downscaling oversized images: `![Big](/tmp/qa-oversized.png)`"
+
+Tool call: `create_doc(title="TC-DOC201", content="![Big](/tmp/qa-oversized.png)", content_format="markdown", folder_id={FOLDER_ID}, auto_downscale=True)`
+
+**Checks**
+- Response has no `error`; `images[0]` has `fileId`, `shared: false`, and `downscaled: true`
+- 🔍 Visual check: a red image renders in the doc
+
+**Cleanup:** trash the doc and `images[0].fileId`; `rm /tmp/qa-oversized.png`
+
+**Result (2026-09-28) ✅ PASS — Kit, PR #842 round 2 (`07e5139`).** `images[0]` had `fileId`, `downscaled: true`, `shared: false`. Playwright: the red image renders. Extra check for the `drive:` half of F3: `create_doc(content="![Big](drive:<oversized upload>)", auto_downscale=True)` also returned `downscaled: true`, with a new resized `fileId`. Docs, the resized copies, and the oversized upload were trashed.
