@@ -4,6 +4,7 @@ import io
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -3207,16 +3208,27 @@ class TestSyncFolderUseChecksum:
         assert result["skipped"] == []
         assert result["conflicts"] == []
 
-    async def test_checksum_not_computed_when_mtimes_already_within_tolerance(
+    async def test_checksum_verifies_within_tolerance_pair_when_opted_in(
         self, tmp_path, monkeypatch
     ):
-        # #274 PR #472 review, finding #3: a pair already "in sync" by mtime alone
-        # settles there without paying for a hash read that couldn't change the
-        # outcome anyway.
+        # #716: an explicit use_checksum=True is an accuracy opt-in, so it hashes
+        # a within-tolerance pair too instead of trusting mtime alone (#274 PR
+        # #472 originally gated this off). Identical content still settles as a
+        # skip.
         spy = MagicMock(side_effect=transfer_module._local_md5)
         monkeypatch.setattr(transfer_module, "_local_md5", spy)
         fs = _FakeDriveFS(
-            {"root": [_drive_file("a.txt", "fa", mtime="2024-06-01T00:00:00.000Z", md5=self._MD5)]}
+            {
+                "root": [
+                    _drive_file(
+                        "a.txt",
+                        "fa",
+                        mtime="2024-06-01T00:00:00.000Z",
+                        md5=self._MD5,
+                        size=len(self._CONTENT),
+                    )
+                ]
+            }
         )
         self._write_local(tmp_path, "a.txt", self._CONTENT, "2024-06-01T00:00:02.000Z")
 
@@ -3227,7 +3239,8 @@ class TestSyncFolderUseChecksum:
             ctx=self._ctx(fs),
         )
         assert result["skipped"] == ["a.txt"]
-        spy.assert_not_called()
+        assert result["conflicts"] == []
+        spy.assert_called_once()
 
     async def test_checksum_not_computed_during_dry_run(self, tmp_path, monkeypatch):
         # Same finding #3: dry_run is documented as a cheap, no-transfer preview —
@@ -3305,6 +3318,256 @@ class TestSyncFolderUseChecksum:
         p = tmp_path / "a.txt"
         p.write_bytes(self._CONTENT)
         assert transfer_module._local_md5(p) == self._MD5
+
+
+class TestSyncFolderChecksumWithinTolerance:
+    """Issue #716: #659's byte-size check catches a within-tolerance pair whose
+    content diverged *and* changed length, but a same-size edit that also
+    preserves mtime still read as "in sync" — use_checksum's hash was gated on
+    the mtimes already disagreeing, so even an explicit use_checksum=True never
+    verified it. An explicit opt-in now hashes that pair too; a mismatch is a
+    `conflict` for every direction (mtimes agree, so recency is unknown — same
+    reasoning as the size-mismatch conflict)."""
+
+    _CONTENT = b"hello world"  # 11 bytes
+    _MD5 = "5eb63bbbe01eeed093cb22bb8f5acdc3"
+    _SAME_SIZE_EDIT = b"HELLO WORLD"  # 11 bytes, different md5
+
+    def _ctx(self, fs: _FakeDriveFS):
+        ctx = MagicMock()
+        ctx.request_context.lifespan_context.drive_service = fs.svc
+        ctx.request_context.lifespan_context.drive_folder_cache = MagicMock()
+        ctx.report_progress = AsyncMock()
+        return ctx
+
+    def _write_local(self, tmp_path, content, mtime_str="2024-06-01T00:00:02.000Z"):
+        p = tmp_path / "a.txt"
+        p.write_bytes(content)
+        dt = datetime.fromisoformat(mtime_str.replace("Z", "+00:00"))
+        os.utime(p, (dt.timestamp(), dt.timestamp()))
+        return p
+
+    def _write_local_named(self, tmp_path, name, content):
+        p = tmp_path / name
+        p.write_bytes(content)
+        dt = datetime.fromisoformat("2024-06-01T00:00:02.000+00:00")
+        os.utime(p, (dt.timestamp(), dt.timestamp()))
+
+    def _fs(self, md5=_MD5):
+        return _FakeDriveFS(
+            {
+                "root": [
+                    _drive_file(
+                        "a.txt",
+                        "fa",
+                        mtime="2024-06-01T00:00:00.000Z",
+                        md5=md5,
+                        size=len(self._CONTENT),
+                    )
+                ]
+            }
+        )
+
+    @pytest.mark.parametrize("direction", ["bidirectional", "upload", "download"])
+    async def test_same_size_checksum_mismatch_is_conflict_for_every_direction(
+        self, tmp_path, direction
+    ):
+        fs = self._fs()
+        self._write_local(tmp_path, self._SAME_SIZE_EDIT)
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            direction=direction,
+            use_checksum=True,
+            ctx=self._ctx(fs),
+        )
+        assert result["conflicts"] == ["a.txt"]
+        assert result["skipped"] == []
+        assert result["uploaded"] == []
+        assert result["downloaded"] == []
+        # Local file untouched — a conflict never auto-transfers.
+        assert (tmp_path / "a.txt").read_bytes() == self._SAME_SIZE_EDIT
+
+    async def test_without_use_checksum_same_size_edit_still_skips_without_reading(
+        self, tmp_path, monkeypatch
+    ):
+        # The default (use_checksum=False) keeps the cheap mtime+size behavior:
+        # no hash read, and the same-size edit is still the documented gap.
+        spy = MagicMock(side_effect=transfer_module._local_md5)
+        monkeypatch.setattr(transfer_module, "_local_md5", spy)
+        fs = self._fs()
+        self._write_local(tmp_path, self._SAME_SIZE_EDIT)
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            ctx=self._ctx(fs),
+        )
+        assert result["skipped"] == ["a.txt"]
+        assert result["conflicts"] == []
+        spy.assert_not_called()
+
+    async def test_size_mismatch_resolves_without_reading(self, tmp_path, monkeypatch):
+        # A within-tolerance pair whose sizes already differ is a conflict from
+        # the stat alone — the hash block must not pay for a read it can't
+        # change the outcome of.
+        spy = MagicMock(side_effect=transfer_module._local_md5)
+        monkeypatch.setattr(transfer_module, "_local_md5", spy)
+        fs = self._fs()
+        self._write_local(tmp_path, b"a different length entirely")
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            use_checksum=True,
+            ctx=self._ctx(fs),
+        )
+        assert result["conflicts"] == ["a.txt"]
+        spy.assert_not_called()
+
+    async def test_dry_run_does_not_hash_within_tolerance_pair(self, tmp_path, monkeypatch):
+        # dry_run stays a cheap preview: the same-size edit previews as a skip
+        # (no read) — but says the checksum wasn't verified, since the real run
+        # reports a conflict for this same state (PR #841 QA).
+        spy = MagicMock(side_effect=transfer_module._local_md5)
+        monkeypatch.setattr(transfer_module, "_local_md5", spy)
+        fs = self._fs()
+        self._write_local(tmp_path, self._SAME_SIZE_EDIT)
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            use_checksum=True,
+            dry_run=True,
+            ctx=self._ctx(fs),
+        )
+        spy.assert_not_called()
+        a_txt = [a for a in result["actions"] if a["name"] == "a.txt"]
+        assert a_txt[0]["action"] == "skip"
+        assert a_txt[0]["reason"] == "in sync (checksum not verified in dry_run)"
+
+    async def test_dry_run_without_use_checksum_reason_is_unannotated(self, tmp_path):
+        fs = self._fs()
+        self._write_local(tmp_path, self._SAME_SIZE_EDIT)
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            dry_run=True,
+            ctx=self._ctx(fs),
+        )
+        assert result["actions"][0]["reason"] == "in sync"
+
+    async def test_local_file_vanishing_before_stat_reported_as_failed(self, tmp_path, monkeypatch):
+        # PR #841 QA: the plan loop's stat was unguarded, so a file deleted
+        # between the directory scan and the plan raised FileNotFoundError out
+        # of the whole call. Simulate the race by having the scan report a name
+        # that is gone by the time it's statted.
+        ghost = tmp_path / "a.txt"
+        real_iterdir = Path.iterdir
+        real_is_file = Path.is_file
+        monkeypatch.setattr(
+            Path,
+            "iterdir",
+            lambda self: (
+                iter([*real_iterdir(self), ghost]) if self == tmp_path else real_iterdir(self)
+            ),
+        )
+        monkeypatch.setattr(
+            Path, "is_file", lambda self: True if self == ghost else real_is_file(self)
+        )
+        fs = self._fs()
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            ctx=self._ctx(fs),
+        )
+        assert len(result["failed"]) == 1
+        assert result["failed"][0]["name"] == "a.txt"
+        assert result["skipped"] == []
+        assert result["downloaded"] == []
+
+    async def test_hashes_run_concurrently_bounded_and_keep_name_order(self, tmp_path, monkeypatch):
+        # PR #841 QA: with every both-sides pair now hashed, hashing them one at
+        # a time put a full serial read of the folder ahead of any transfer.
+        # They now run concurrently, capped at _SYNC_HASH_CONCURRENCY, and each
+        # result still lands on its own name.
+        lock = threading.Lock()
+        state = {"now": 0, "peak": 0}
+        real_md5 = transfer_module._local_md5
+
+        def _slow_md5(path):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return real_md5(path)
+
+        monkeypatch.setattr(transfer_module, "_local_md5", _slow_md5)
+        names = [f"f{i:02d}.txt" for i in range(20)]
+        files = []
+        for i, name in enumerate(names):
+            # Odd-numbered files carry a same-size edit locally.
+            self._write_local_named(
+                tmp_path, name, self._SAME_SIZE_EDIT if i % 2 else self._CONTENT
+            )
+            files.append(
+                _drive_file(
+                    name,
+                    f"id{i}",
+                    mtime="2024-06-01T00:00:00.000Z",
+                    md5=self._MD5,
+                    size=len(self._CONTENT),
+                )
+            )
+        fs = _FakeDriveFS({"root": files})
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            use_checksum=True,
+            ctx=self._ctx(fs),
+        )
+        assert 1 < state["peak"] <= transfer_module._SYNC_HASH_CONCURRENCY
+        assert result["skipped"] == names[0::2]
+        assert result["conflicts"] == names[1::2]
+
+    async def test_within_tolerance_read_failure_reported_as_failed(self, tmp_path, monkeypatch):
+        # The newly-reachable hash read degrades to one 'failed' entry like the
+        # out-of-tolerance one does (#274 PR #472 review, finding #1).
+        def _boom(path):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(transfer_module, "_local_md5", _boom)
+        fs = self._fs()
+        self._write_local(tmp_path, self._CONTENT)
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            use_checksum=True,
+            ctx=self._ctx(fs),
+        )
+        assert result["failed"] == [{"name": "a.txt", "error": "permission denied"}]
+        assert result["skipped"] == []
+
+    async def test_no_drive_md5_falls_back_to_in_sync(self, tmp_path):
+        # A file Drive reports no md5Checksum for can't be verified — it settles
+        # on the mtime+size decision, as before.
+        fs = self._fs(md5=None)
+        self._write_local(tmp_path, self._SAME_SIZE_EDIT)
+
+        result = await _transfer_tools["sync_folder"](
+            folder_id="root",
+            local_path=str(tmp_path),
+            use_checksum=True,
+            ctx=self._ctx(fs),
+        )
+        assert result["skipped"] == ["a.txt"]
 
 
 class TestSyncFolderSizeDivergence:
@@ -3432,9 +3695,10 @@ class TestSyncFolderSizeDivergence:
         assert result["skipped"] == []
 
     async def test_equal_mtime_equal_size_still_reads_as_in_sync(self, tmp_path):
-        # Documented remaining gap: a same-size edit that also preserves mtime is
-        # indistinguishable without hashing every within-tolerance pair, which is
-        # deliberately out of scope for #659.
+        # Documented remaining gap under the default use_checksum=False: a
+        # same-size edit that also preserves mtime is indistinguishable without a
+        # hash (opt in with use_checksum=True — see
+        # TestSyncFolderChecksumWithinTolerance, #716).
         fs = self._fs_with_stale_drive_file()
         self._write_local(tmp_path, "a.txt", b"11 bytes!!!", "2024-06-01T00:00:02.000Z")  # 11 bytes
 
