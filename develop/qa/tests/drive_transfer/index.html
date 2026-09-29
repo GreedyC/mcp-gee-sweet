@@ -1502,7 +1502,9 @@ heading + real 2×2 table render correctly</p>
 <p><strong>Checks</strong>
 - File appears in Drive with <code>mimeType: image/png</code>
 - <code>skipped: false</code> in response
+- Response includes <code>web_content_link</code> (Drive's direct-download URL, <code>https://drive.google.com/uc?id=&lt;fileId&gt;&amp;export=download</code>) alongside <code>web_link</code> (#511)
 - <code>list_files</code> for <code>{FOLDER_ID}</code> includes the new file after upload</p>
+<p><strong>Result (2026-09-28) ✅ PASS (<code>web_content_link</code> check only) — Kit, PR #842 round 1 (issue #511).</strong> Two <code>upload_local_file</code> calls with the pixel PNG and <code>skip_if_exists=False</code> each returned <code>skipped: false</code> and <code>web_content_link</code> = <code>https://drive.google.com/uc?id=&lt;fileId&gt;&amp;export=download</code> next to <code>web_link</code>. The uploads were used as TC-DOC151/F1 fixtures and then trashed.</p>
 <hr />
 <h3 id="tc-d94-skip_if_exists-prevents-re-upload-local-filesystem">TC-D94: skip_if_exists prevents re-upload ⚠️ local-filesystem<a class="headerlink" href="#tc-d94-skip_if_exists-prevents-re-upload-local-filesystem" title="Permanent link">&para;</a></h3>
 <p><strong>Prompt</strong> (run twice, same file)</p>
