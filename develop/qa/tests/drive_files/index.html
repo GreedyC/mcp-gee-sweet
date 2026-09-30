@@ -2033,7 +2033,8 @@ delete_file('QA-Folder-Renamed', permanent=False) → <code>{fileId, action:"tra
 delete_file('invalidid123xyz') → HttpError 404 propagates cleanly, no crash. No cache mutation (parents fetch fails before any mutation).</p>
 <hr />
 <h2 id="restore_file"><code>restore_file</code><a class="headerlink" href="#restore_file" title="Permanent link">&para;</a></h2>
-<h3 id="tc-d202-restore-a-trashed-file-destructive">TC-D202: Restore a trashed file ⚠️ destructive<a class="headerlink" href="#tc-d202-restore-a-trashed-file-destructive" title="Permanent link">&para;</a></h3>
+<h3 id="tc-d269-restore-a-trashed-file-destructive">TC-D269: Restore a trashed file ⚠️ destructive<a class="headerlink" href="#tc-d269-restore-a-trashed-file-destructive" title="Permanent link">&para;</a></h3>
+<p><em>Formerly TC-D202, which collided with <code>star_file</code>'s own TC-D202 above; renumbered per #590.</em></p>
 <p><strong>Setup:</strong> Create a throwaway spreadsheet in {FOLDER_ID}, then trash it (<code>delete_file</code> with <code>permanent=False</code>).</p>
 <p><strong>Prompt</strong></p>
 <blockquote>
@@ -2045,7 +2046,8 @@ delete_file('invalidid123xyz') → HttpError 404 propagates cleanly, no crash. N
 - Parent folder cache invalidated</p>
 <p><strong>Result (2026-07-21) ✅</strong> — Created "QA-Restore-Test" in {FOLDER_ID}, trashed it, then <code>restore_file</code> returned <code>{"fileId": "12GPwkr-...", "action": "restored"}</code>. Follow-up <code>list_files</code> on {FOLDER_ID} showed the file present with no manual <code>refresh_cache</code> needed, confirming the parent-folder cache was invalidated by the tool itself. Cleaned up (permanently deleted) after the test.</p>
 <hr />
-<h3 id="tc-d203-restore-a-non-existent-file-id">TC-D203: Restore a non-existent file ID<a class="headerlink" href="#tc-d203-restore-a-non-existent-file-id" title="Permanent link">&para;</a></h3>
+<h3 id="tc-d270-restore-a-non-existent-file-id">TC-D270: Restore a non-existent file ID<a class="headerlink" href="#tc-d270-restore-a-non-existent-file-id" title="Permanent link">&para;</a></h3>
+<p><em>Formerly TC-D203, which collided with <code>unstar_file</code>'s own TC-D203 above; renumbered per #590.</em></p>
 <p><strong>Prompt</strong></p>
 <blockquote>
 <p>"Restore file 'invalidid123xyz'"</p>
