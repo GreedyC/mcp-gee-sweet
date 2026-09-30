@@ -157,3 +157,19 @@ longer agree (#805).
 delete the old Doc in Drive; the next sync converts the file again under its new name. Renaming
 both sides to the same new name doesn't restore the link, because the digest still records the
 old name.
+
+### `sync_folder` — a `convert_markdown` Doc edited in Drive stays a conflict until it's replaced
+
+**What:** Once a converted Doc is edited in Drive, every `sync_folder` run reports it under
+`conflicts`, including after the local `.md` is edited too. Editing or touching the local file
+doesn't clear the conflict, and there's no parameter to accept the Drive version as the new
+baseline or to force the upload over it.
+
+**Why:** There's no reverse conversion (Doc → Markdown), so the Drive edit can't be downloaded.
+The only way to pick up the local file would be to overwrite the Drive edit, which is what
+`sync_folder` used to do silently and now refuses (#814). A Drive edit is detected from the
+Doc's revision history, which only a new upload resets.
+
+**Workaround:** Carry the Drive edits into the local `.md` by hand, then rename or remove the Doc
+in Drive and sync again. The next sync converts the local file into a new Doc. That new Doc has
+a new file ID, so re-share it and update any links that pointed to the old one.

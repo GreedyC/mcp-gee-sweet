@@ -1910,3 +1910,53 @@ Trash `{FOLDER_ID}` and its contents. Remove `/tmp/qa-267/`.
 - `convert_markdown` regression check, run again at `b4e6439`: upload, then dry-run resync reports `skip` / "in sync".
 - The round-1 findings are all addressed in `b4e6439`, confirmed from its diff: the docstring is now consistent, the mtime is read inside the `try` at both sites (each with a new unit test), a single `_local_mtime_dt`, the stale comment is dropped, and the restamp test is parametrized.
 - Unit suite at `b4e6439`: 1739 passed, 3 skipped; ruff check and format are clean.
+
+### TC-D271: `sync_folder(convert_markdown=True)` — a Drive-side edit made right after a sync is a `conflict` on an immediate re-sync, and an unedited Doc settles into `skipped` whatever its `modifiedTime` does (issue #814) ⚠️ destructive ⚠️ local-filesystem
+
+**Background:** Drive updates a Google Doc's `modifiedTime` from the Docs backend asynchronously, minutes behind. That late update overwrote the post-create restamp (an unedited Doc then sat in `conflicts` on every sync), and it also hid real Drive edits for 1.5–5 minutes, so a sync in that window reported an edited Doc as in sync. A converted Doc now carries `geeSweetSourceMtime` (the local mtime at upload), and its Drive side is judged from revision history. The first sync after an upload records the import's revision ID in `geeSweetImportRevision`, and any later revision is a Drive edit. See `docs/decisions/decision-converted-doc-change-detection.md`.
+
+**Setup**
+Create a scratch Drive folder `{FOLDER_ID}`. Locally, create `/tmp/qa-271/` containing `a.md`, `b.md`, `c.md`, `d.md`, `e.md`, and `f.md`, each holding `# Heading` and one paragraph of body text.
+
+**Tool calls**
+1. `sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-271/", direction="upload", convert_markdown=True)`
+2. `sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-271/", direction="bidirectional", convert_markdown=True)`. Run it about 10 seconds after call 1.
+3. `insert_doc_text(doc_id={ID of a.md}, insertions=[{"index": 1, "text": "Drive edit\n"}])`
+4. Within 30 seconds of call 3: `sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-271/", direction="bidirectional", convert_markdown=True, dry_run=True)`
+5. The same call without `dry_run`.
+6. Wait 5 minutes, then repeat call 5.
+
+**Checks**
+- Call 1: `uploaded` holds all 6 names, and `failed == []`.
+- A scratch-script `files().list(fields="files(name,properties)")` after call 1 shows `geeSweetSourceMtime` on every Doc, equal to that local file's mtime (`YYYY-MM-DDTHH:MM:SS.000Z`), and no `geeSweetBaselineRevision`.
+- Call 2: all 6 names are in `skipped`, and `conflicts == []` and `failed == []`, even for any Doc whose `get_file_metadata` `modified_time` has drifted from its local mtime. Afterwards each Doc carries `geeSweetImportRevision`, equal to the only revision ID `list_revisions` returns for it.
+- Call 4: the `a.md` action is `conflict`, with a reason starting "edited in Drive since the last upload". The other 5 are `skip`. `get_file_metadata` on `a.md` may still show the pre-edit `modified_time`, which is expected, and is exactly what used to hide the edit.
+- Call 5: `conflicts == ["a.md"]`, the other 5 are in `skipped`, and `uploaded == []`. `get_doc_content` on `a.md` still contains "Drive edit".
+- Call 6: the same as call 5. No drift-induced conflict appears on `b.md`–`f.md`.
+
+**Teardown**
+Trash `{FOLDER_ID}` and its contents. Remove `/tmp/qa-271/`.
+
+### TC-D272: `sync_folder(convert_markdown=True)` — a local-only change re-uploads and settles; a change on both sides is a `conflict`, never an overwrite of the Drive edit (issue #814) ⚠️ destructive ⚠️ local-filesystem
+
+**Background:** Before #814, a converted Doc edited in Drive *and* locally read as "local newer" and was re-uploaded, silently replacing the Drive edit. Now a re-upload stamps the Doc's latest revision from just before the upload as `geeSweetBaselineRevision`, and clears `geeSweetImportRevision`. The next sync takes the first revision after that baseline as the new import. A local change goes up only when the Drive side is unchanged.
+
+**Setup**
+Create a scratch Drive folder `{FOLDER_ID}` and `/tmp/qa-272/` containing `x.md` and `y.md`, each holding `# Heading` and one paragraph. Run `sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-272/", direction="upload", convert_markdown=True)`, wait about 10 seconds, then run the same call with `direction="bidirectional"` so both Docs record their import revision.
+
+**Tool calls**
+1. Append a line `local edit` to `/tmp/qa-272/x.md`. Then `sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-272/", direction="bidirectional", convert_markdown=True)`
+2. About 10 seconds later, repeat call 1 with no further edits.
+3. `insert_doc_text(doc_id={ID of y.md}, insertions=[{"index": 1, "text": "Drive edit\n"}])`, and append a line `local edit` to `/tmp/qa-272/y.md`. Then `sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-272/", direction="bidirectional", convert_markdown=True, dry_run=True)`
+4. The same call without `dry_run`.
+5. `sync_folder(folder_id={FOLDER_ID}, local_path="/tmp/qa-272/", direction="download", convert_markdown=True, dry_run=True)`, after appending another line to `/tmp/qa-272/x.md`.
+
+**Checks**
+- Call 1: `uploaded == ["x.md"]` and `y.md` is in `skipped`. The same file ID is reused (not a new Doc). The scratch-script properties listing shows `x.md` with `geeSweetBaselineRevision` equal to its pre-upload latest revision ID (from `list_revisions` before call 1), a new `geeSweetSourceMtime`, and no `geeSweetImportRevision`.
+- Call 2: both names are in `skipped`, and `x.md` now carries `geeSweetImportRevision`, equal to the revision after the baseline. If call 2 runs before Drive lists the new revision, `x.md` is still `skipped` and the property is recorded on a later sync.
+- Call 3: the `y.md` action is `conflict`, with a reason starting "edited both locally and in Drive".
+- Call 4: `conflicts == ["y.md"]` and `uploaded == []`. `get_doc_content` on `y.md` still contains "Drive edit", and not "local edit".
+- Call 5: the `x.md` action is `conflict`, with reason "local .md changed since the last upload but direction is download".
+
+**Teardown**
+Trash `{FOLDER_ID}` and its contents. Remove `/tmp/qa-272/`.
