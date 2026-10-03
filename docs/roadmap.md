@@ -210,6 +210,7 @@ Same shape as v0.8.1 — stabilize on defects that surfaced since v0.9.0 shipped
 - [x] auth: with no `token.json`, a stdio server blocks on OAuth consent with no timeout, and the consent prompt goes to the protocol channel ([#811](https://github.com/khuisman/mcp-gee-sweet/issues/811)) (PR #828)
 - [x] auth: under `--transport sse`, the OAuth consent wait runs synchronously on the event loop, stalling every other session and ignoring SIGTERM until consent or timeout. #811 follow-up, found in PR #828 ([#833](https://github.com/khuisman/mcp-gee-sweet/issues/833)) (PR #867)
 - [ ] Tool errors are opaque on PyPI installs: `mcp` 2.3 (what `uvx` resolves; the lock pins 2.0.0) hides any non-`ToolError` exception text, so #811's "run `mcp-gee-sweet auth`" message and uncaught Google API errors reach the client as a bare `Error executing tool <name>`. Observed live. Urgent: lane-a, next after #844 ([#872](https://github.com/khuisman/mcp-gee-sweet/issues/872))
+- [ ] auth: offer OAuth re-authorization from the failing tool call, via URL-mode elicitation with the consent URL in a `ToolError` as fallback, then rebuild services in place. Covers a refresh token revoked mid-session too. No unprompted browser. Lane-a, after #872 ([#873](https://github.com/khuisman/mcp-gee-sweet/issues/873))
 
 **Sheets hardening** _(triaged out of `backlog` 2026-09-11 — see the "Backlog triage" note below)_
 - [x] `update_sheet_properties`/dimension-tool hardening + dedup follow-ups from PR #321's review ([#323](https://github.com/khuisman/mcp-gee-sweet/issues/323)) (PR #734)
