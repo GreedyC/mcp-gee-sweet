@@ -1,10 +1,17 @@
+import asyncio
 import base64
 import json
 import logging
 import os
+import socket
 import sys
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, redirect_stdout
+import threading
+import time
+import webbrowser
+import wsgiref.simple_server
+import wsgiref.util
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -76,9 +83,21 @@ def get_gmail_unauthorized_message() -> str | None:
 _interactive_consent = True
 _STDIO_NO_CONSENT_REASON = "this server can't ask for consent itself over the stdio transport"
 # Why consent is off, for the error message. The lifespan also turns it off after a
-# failed attempt: under SSE the lifespan runs once per connection, and the wait is
-# synchronous, so retrying would block every session for the timeout again.
+# failed attempt: under SSE the lifespan runs once per connection, and an unattended
+# server shouldn't print a fresh prompt and hold each new connection for the timeout.
 _interactive_consent_off_reason = _STDIO_NO_CONSENT_REASON
+
+
+# Whether an auth failure in the lifespan raises (stdio: the server exits, as #790
+# chose) or starts that connection without Google access (every other transport).
+# server.main() turns it on for stdio. Under SSE a raising lifespan can leave the
+# server unable to shut down (python-sdk#3616), and the server keeps running anyway.
+_raise_auth_failures = False
+
+
+def set_raise_auth_failures(enabled: bool) -> None:
+    global _raise_auth_failures
+    _raise_auth_failures = enabled
 
 
 def set_interactive_consent(allowed: bool, reason: str = _STDIO_NO_CONSENT_REASON) -> None:
@@ -112,6 +131,19 @@ def required_scopes() -> list[str]:
 class OAuthConsentRequiredError(RuntimeError):
     """There's no usable OAuth token, and the interactive consent flow can't run here
     (stdio transport) or didn't complete (#811)."""
+
+
+class _ConsentDeferred(Exception):
+    """_oauth_creds(defer_consent=True) found no usable token and consent is allowed:
+    the caller runs the consent itself, off the event loop (#833)."""
+
+    def __init__(self, scopes: list[str]):
+        super().__init__("OAuth consent needed")
+        self.scopes = scopes
+
+
+class _ConsentStopped(Exception):
+    """The consent wait was stopped because nothing is waiting for it any more."""
 
 
 class MissingOAuthScopesError(RuntimeError):
@@ -246,8 +278,11 @@ def _degrade_gmail(missing: list[str]) -> None:
     logger.warning("Gmail tools disabled: %s", _gmail_unauthorized_message)
 
 
-def _oauth_creds() -> Credentials:
+def _oauth_creds(*, defer_consent: bool = False) -> Credentials:
     """Obtain OAuth credentials, refreshing or running the interactive flow as needed.
+
+    With `defer_consent`, raises _ConsentDeferred instead of running the interactive
+    flow here; the lifespan uses that to run it off the event loop (#833).
 
     The interactive flow only runs when there's no usable token at all. A token
     authorized for fewer scopes than the enabled tools need raises
@@ -310,30 +345,291 @@ def _oauth_creds() -> Credentials:
     if not creds or not creds.valid:
         _check_client_secrets()
         if not _interactive_consent:
-            raise OAuthConsentRequiredError(
-                f"No usable OAuth token at {TOKEN_PATH!r}, and "
-                f"{_interactive_consent_off_reason}. {reauthorize_instructions()}"
-            )
-        # Even outside stdio, stdout is no place for the prompt: send it to stderr,
-        # and bound the wait so an unattended server doesn't block forever (#811).
-        try:
-            with redirect_stdout(sys.stderr):
-                creds = run_consent_flow(scopes, timeout_seconds=_CONSENT_TIMEOUT_SECONDS)
-        except WSGITimeoutError as e:
-            raise OAuthConsentRequiredError(
-                f"No usable OAuth token at {TOKEN_PATH!r}, and the browser consent wasn't "
-                f"completed within {_CONSENT_TIMEOUT_SECONDS}s. {reauthorize_instructions()}"
-            ) from e
-        except Exception as e:
-            # Denied consent, a scope unticked on the granular-consent screen, a stray
-            # request consuming the one callback, an unwritable TOKEN_PATH: all leave
-            # the server exactly where a timeout does.
-            raise OAuthConsentRequiredError(
-                f"No usable OAuth token at {TOKEN_PATH!r}, and the browser consent "
-                f"failed ({type(e).__name__}: {e}). {reauthorize_instructions()}"
-            ) from e
+            raise _consent_off_error()
+        if defer_consent:
+            raise _ConsentDeferred(scopes)
+        creds = _run_server_consent(scopes, threading.Event())
 
     return creds
+
+
+def _consent_off_error() -> OAuthConsentRequiredError:
+    return OAuthConsentRequiredError(
+        f"No usable OAuth token at {TOKEN_PATH!r}, and "
+        f"{_interactive_consent_off_reason}. {reauthorize_instructions()}"
+    )
+
+
+async def _oauth_creds_async() -> Credentials:
+    """_oauth_creds for the lifespan. Nothing here runs on the event loop (#833): the
+    token load and refresh run on a daemon thread, and so does the consent wait, so
+    other connections keep being served and SIGTERM still stops the server. Before,
+    a consent wait (or a hanging token endpoint) blocked the loop."""
+    successes = _consent_successes
+    try:
+        return await _load_token()
+    except _ConsentDeferred as deferred:
+        if _consent_successes == successes:
+            return await _await_server_consent(deferred.scopes)
+    # A consent succeeded while this load ran on its thread, so the load may have read
+    # TOKEN_PATH just before the token was written. Read it again rather than start a
+    # second consent (PR #867 QA round 4).
+    try:
+        return await _load_token()
+    except _ConsentDeferred as deferred:
+        return await _await_server_consent(deferred.scopes)
+
+
+async def _load_token() -> Credentials:
+    loading = _run_in_daemon_thread(
+        asyncio.get_running_loop(), lambda: _oauth_creds(defer_consent=True), name="oauth-token"
+    )
+    return await _await_unless_shutdown(
+        loading,
+        f"No usable OAuth token yet: the server shut down while loading the token at "
+        f"{TOKEN_PATH!r}.",
+    )
+
+
+def _run_server_consent(scopes: list[str], stop: threading.Event) -> Credentials:
+    """The server's consent flow: prompt on stderr, bounded by OAUTH_CONSENT_TIMEOUT_SECONDS
+    (#811), stoppable through `stop`. Every failure becomes OAuthConsentRequiredError."""
+    try:
+        creds = _serve_consent(_new_flow(scopes), _CONSENT_TIMEOUT_SECONDS, stop)
+        _write_token(creds)
+    except _ConsentStopped:
+        raise
+    except WSGITimeoutError as e:
+        raise OAuthConsentRequiredError(
+            f"No usable OAuth token at {TOKEN_PATH!r}, and the browser consent wasn't "
+            f"completed within {_CONSENT_TIMEOUT_SECONDS}s. {reauthorize_instructions()}"
+        ) from e
+    except Exception as e:
+        # Denied consent, a scope unticked on the granular-consent screen, a stray
+        # request consuming the one callback, an unwritable TOKEN_PATH: all leave
+        # the server exactly where a timeout does.
+        raise OAuthConsentRequiredError(
+            f"No usable OAuth token at {TOKEN_PATH!r}, and the browser consent "
+            f"failed ({type(e).__name__}: {e}). {reauthorize_instructions()}"
+        ) from e
+    logger.debug("OAuth flow completed successfully")
+    return creds
+
+
+_CONSENT_PROMPT = "Please visit this URL to authorize this application: {url}"
+_CONSENT_SUCCESS_PAGE = "The authentication flow has completed. You may close this window."
+# How often the callback server's wait checks the deadline and the stop flag.
+_CONSENT_POLL_SECONDS = 0.5
+
+
+class _CallbackApp:
+    """Records the first request to the callback server. A stray request ends the wait
+    too, as it does with google-auth-oauthlib's own server (its state won't match)."""
+
+    def __init__(self):
+        self.request_uri: str | None = None
+
+    def __call__(self, environ, start_response):
+        start_response("200 OK", [("Content-type", "text/plain; charset=utf-8")])
+        self.request_uri = wsgiref.util.request_uri(environ)
+        return [_CONSENT_SUCCESS_PAGE.encode()]
+
+
+class _CallbackHandler(wsgiref.simple_server.WSGIRequestHandler):
+    # A connection that sends nothing (a browser preconnect, a port scanner) would
+    # otherwise block handle_request() in readline() until the client hung up, and
+    # the deadline and stop checks between requests would never run (PR #867 QA).
+    timeout = 5
+
+    def log_message(self, format, *args):
+        # Not logged at all: the request line carries the authorization code.
+        pass
+
+
+class _CallbackServer(wsgiref.simple_server.WSGIServer):
+    # As in google-auth-oauthlib: on Windows, SO_REUSEADDR alone would let another
+    # process bind the same port and receive the authorization code.
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def handle_error(self, request, client_address):
+        # socketserver's default prints a traceback to stderr. A silent connection
+        # timing out is expected, and nothing here is worth a traceback.
+        logger.debug("Consent callback: dropped a connection", exc_info=True)
+
+
+def _serve_consent(
+    flow: InstalledAppFlow, timeout_seconds: float, stop: threading.Event
+) -> Credentials:
+    """InstalledAppFlow.run_local_server, but stoppable from another thread, and with
+    its prompt written to stderr instead of print()ed to stdout. The library's wait is
+    one blocking handle_request() for the whole timeout, and its prompt could only be
+    moved with redirect_stdout, which swaps sys.stdout for every thread (#833)."""
+    app = _CallbackApp()
+    server = wsgiref.simple_server.make_server(
+        "localhost", 0, app, server_class=_CallbackServer, handler_class=_CallbackHandler
+    )
+    try:
+        flow.redirect_uri = f"http://localhost:{server.server_port}/"
+        auth_url, _ = flow.authorization_url()
+        try:
+            webbrowser.get().open(auth_url, new=1, autoraise=True)
+        except webbrowser.Error:
+            logger.debug("No browser to open for the consent; the URL is on stderr")
+        print(_CONSENT_PROMPT.format(url=auth_url), file=sys.stderr, flush=True)
+        server.timeout = _CONSENT_POLL_SECONDS
+        deadline = time.monotonic() + timeout_seconds
+        while app.request_uri is None:
+            if stop.is_set():
+                raise _ConsentStopped()
+            if time.monotonic() >= deadline:
+                raise WSGITimeoutError("Timed out waiting for response from authorization server")
+            server.handle_request()
+        # oauthlib rejects an http:// redirect; the library makes the same swap for
+        # its localhost callback.
+        flow.fetch_token(authorization_response=app.request_uri.replace("http", "https", 1))
+    finally:
+        server.server_close()
+    return flow.credentials
+
+
+def _run_in_daemon_thread(
+    loop: asyncio.AbstractEventLoop,
+    fn: Callable[[], Any],
+    name: str,
+    on_settle: Callable[[BaseException | None], None] | None = None,
+) -> asyncio.Future:
+    """Run `fn` on a daemon thread and return a future for its result. A daemon
+    thread, not asyncio.to_thread: interpreter shutdown joins the default executor's
+    threads, so a call still waiting there would just move the hang to shutdown.
+    `on_settle` runs on the loop just before the future settles."""
+    future = loop.create_future()
+    # Retrieve the outcome even if every awaiter gave up, so an exception settling
+    # later isn't logged as never retrieved.
+    future.add_done_callback(lambda f: f.cancelled() or f.exception())
+
+    def settle(result: Any, error: BaseException | None) -> None:
+        if on_settle is not None:
+            on_settle(error)
+        if future.done():
+            return
+        if error is None:
+            future.set_result(result)
+        else:
+            future.set_exception(error)
+
+    def run() -> None:
+        try:
+            result, error = fn(), None
+        except BaseException as e:
+            result, error = None, e
+        # RuntimeError: the loop already closed, because the server shut down.
+        with suppress(RuntimeError):
+            loop.call_soon_threadsafe(settle, result, error)
+
+    threading.Thread(target=run, name=name, daemon=True).start()
+    return future
+
+
+async def _await_unless_shutdown(future: asyncio.Future, shutdown_message: str) -> Any:
+    """Await `future`, but give up with OAuthConsentRequiredError(`shutdown_message`)
+    once the server starts shutting down. Uvicorn waits for open connections before
+    exiting, and this one can't finish until its lifespan does, so without this,
+    SIGTERM waits for whatever the thread is waiting on. The future itself isn't
+    cancelled (a shared consent may have other waiters)."""
+    waiter = asyncio.shield(future)
+    try:
+        while True:
+            done, _ = await asyncio.wait({waiter}, timeout=_CONSENT_POLL_SECONDS)
+            if done:
+                return waiter.result()
+            if _server_shutting_down():
+                raise OAuthConsentRequiredError(shutdown_message)
+    finally:
+        waiter.cancel()  # no-op once done; otherwise detaches this waiter
+
+
+class _ConsentAttempt:
+    """One consent flow running on a daemon thread, awaited by every connection
+    that needs it."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, scopes: list[str]):
+        self.stop = threading.Event()
+        self.waiters = 0
+        self.future = _run_in_daemon_thread(
+            loop,
+            lambda: _run_server_consent(scopes, self.stop),
+            name="oauth-consent",
+            on_settle=self._on_settle,
+        )
+
+    @staticmethod
+    def _on_settle(error: BaseException | None) -> None:
+        # A failed attempt turns off consent here, on the loop, before any waiter
+        # sees the failure: not later in the lifespan, which a waterfall fallback
+        # skips, and which a connection opening in between would race (PR #867 QA).
+        # A stopped attempt (every waiter gave up) isn't a failure.
+        # A success is counted here too, so a connection whose token load raced it
+        # reads the saved token instead of starting another consent.
+        global _consent_successes
+        if error is None:
+            _consent_successes += 1
+        elif not isinstance(error, _ConsentStopped):
+            _disable_consent_after_failure()
+
+
+# How many consent attempts have succeeded in this process. Read and bumped on the loop.
+_consent_successes = 0
+
+# Process-wide on purpose: one consent wait (one prompt, one callback port) is shared
+# by every connection that arrives while it runs, rather than one per connection.
+_consent_attempt: _ConsentAttempt | None = None
+
+
+def _server_shutting_down() -> bool:
+    """Whether uvicorn got SIGTERM/SIGINT. sse_starlette's AppStatus flag is set from
+    uvicorn's exit handler; it's how SSE streams learn to close, and the only shutdown
+    signal code inside a connection's lifespan can see."""
+    try:
+        from sse_starlette.sse import AppStatus
+    except ImportError:
+        return False
+    return bool(AppStatus.should_exit)
+
+
+async def _await_server_consent(scopes: list[str]) -> Credentials:
+    global _consent_attempt
+    loop = asyncio.get_running_loop()
+    attempt = _consent_attempt
+    if (
+        attempt is None
+        or attempt.future.done()
+        or attempt.stop.is_set()
+        or attempt.future.get_loop() is not loop
+    ):
+        # Checked again here, on the loop: the token load that decided consent was
+        # needed ran on a thread, and an attempt may have failed (turning consent
+        # off) since. Without this, that caller would start a second consent.
+        if not _interactive_consent:
+            raise _consent_off_error()
+        attempt = _consent_attempt = _ConsentAttempt(loop, scopes)
+    attempt.waiters += 1
+    try:
+        return await _await_unless_shutdown(
+            attempt.future,
+            f"No usable OAuth token at {TOKEN_PATH!r}, and the server shut down "
+            f"before the browser consent completed. {reauthorize_instructions()}",
+        )
+    finally:
+        attempt.waiters -= 1
+        if attempt.waiters == 0 and not attempt.future.done():
+            # Every connection waiting on it gave up (shutdown, or cancelled):
+            # stop the wait now so its callback port closes, instead of at the timeout.
+            attempt.stop.set()
 
 
 def _check_client_secrets() -> None:
@@ -371,12 +667,18 @@ def _write_token(creds: Any) -> None:
     write_token_json(creds.to_json())
 
 
-def run_consent_flow(scopes: list[str], **run_kwargs: Any) -> Credentials:
-    """Run the browser consent flow for `scopes` and save the token to TOKEN_PATH.
-    `run_kwargs` go to InstalledAppFlow.run_local_server."""
+def _new_flow(scopes: list[str]) -> InstalledAppFlow:
     _check_client_secrets()
     _check_token_writable()
-    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, scopes)
+    return InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, scopes)
+
+
+def run_consent_flow(scopes: list[str], **run_kwargs: Any) -> Credentials:
+    """Run the browser consent flow for `scopes` and save the token to TOKEN_PATH.
+    `run_kwargs` go to InstalledAppFlow.run_local_server. For a terminal (`mcp-gee-sweet
+    auth`), where the library's stdout prompt belongs; the server's own consent is
+    _run_server_consent."""
+    flow = _new_flow(scopes)
     creds = flow.run_local_server(port=0, **run_kwargs)
     _write_token(creds)
     logger.debug("OAuth flow completed successfully")
@@ -428,15 +730,20 @@ def _degrade_unauthorized(message: str) -> str:
     # Logged as well: stdio hosts drop stderr, so LOG_FILE is where an operator sees it.
     logger.warning("Starting without Google access: %s", message)
     if _interactive_consent:
-        # Only reachable after a failed SSE consent attempt. The lifespan runs per
-        # connection and the wait is synchronous, so a retry would block every
-        # session again; later connections just re-read TOKEN_PATH instead.
-        set_interactive_consent(
-            False,
-            reason="an earlier browser consent in this server process didn't complete "
-            "(it isn't retried, since waiting for it blocks every connection)",
-        )
+        # Normally already off: a failed attempt turns it off as it settles. Kept for
+        # a degrade that didn't come from a settled attempt (e.g. a shutdown).
+        _disable_consent_after_failure()
     return message
+
+
+def _disable_consent_after_failure() -> None:
+    # The lifespan runs per connection, so a retry would make each new connection
+    # wait for the timeout again; later connections just re-read TOKEN_PATH instead.
+    set_interactive_consent(
+        False,
+        reason="an earlier browser consent in this server process didn't complete "
+        "(it isn't retried, so new connections don't each wait for it again)",
+    )
 
 
 def _unusable_fallbacks_note(adc_error: Exception) -> str:
@@ -484,11 +791,56 @@ def get_lifespan_context() -> SpreadsheetContext:
     return _lifespan_context
 
 
+def _degraded_context(message: str | None) -> SpreadsheetContext:
+    # No services to build. server.py's tool wrapper raises context.unauthorized_message
+    # before any tool body can reach them.
+    return SpreadsheetContext(
+        sheets_service=None,
+        drive_service=None,
+        docs_service=None,
+        calendar_service=None,
+        activity_service=None,
+        gmail_service=None,
+        folder_id=DRIVE_FOLDER_ID if DRIVE_FOLDER_ID else None,
+        auth_method="none",
+        unauthorized_message=message,
+    )
+
+
+def _auth_failure_message(error: Exception) -> str:
+    message = str(error)
+    if error.__cause__ is not None:
+        message = f"{message} ({type(error.__cause__).__name__}: {error.__cause__})"
+    return message
+
+
 @asynccontextmanager
 async def spreadsheet_lifespan(server: MCPServer) -> AsyncIterator[SpreadsheetContext]:
+    global _lifespan_context
+    try:
+        context = await _build_context()
+    except Exception as e:
+        # Over SSE, raising here leaves a POST that raced in parked forever in mcp's
+        # transport (its per-session stream is never closed when the lifespan fails),
+        # and SIGTERM then waits on it (python-sdk#3616, PR #867 QA round 2). The server
+        # keeps running either way, so start this connection without Google access and
+        # give the client the reason on every tool call instead.
+        if _raise_auth_failures:
+            raise
+        message = _auth_failure_message(e)
+        logger.error("Starting without Google access: %s", message)
+        logger.debug("Auth failure detail", exc_info=True)
+        context = _degraded_context(message)
+    _lifespan_context = context
+    try:
+        yield context
+    finally:
+        _lifespan_context = None
+
+
+async def _build_context() -> SpreadsheetContext:
     from googleapiclient.discovery import build
 
-    global _lifespan_context
     logger.debug("AUTH_METHOD=%s", AUTH_METHOD or "auto (waterfall)")
     resolved = "unknown"
     unauthorized = None
@@ -497,7 +849,7 @@ async def spreadsheet_lifespan(server: MCPServer) -> AsyncIterator[SpreadsheetCo
 
     if AUTH_METHOD == "oauth":
         try:
-            creds = _oauth_creds()
+            creds = await _oauth_creds_async()
             resolved = "oauth"
         except OAuthConsentRequiredError as e:
             creds = None
@@ -528,7 +880,7 @@ async def spreadsheet_lifespan(server: MCPServer) -> AsyncIterator[SpreadsheetCo
 
         # 1. OAuth
         try:
-            creds = _oauth_creds()
+            creds = await _oauth_creds_async()
             resolved = "oauth"
             logger.debug("Waterfall: using OAuth")
         except MissingOAuthScopesError:
@@ -567,25 +919,7 @@ async def spreadsheet_lifespan(server: MCPServer) -> AsyncIterator[SpreadsheetCo
                 )
 
     if creds is None:
-        # Degraded start: no services to build. server.py's tool wrapper raises
-        # context.unauthorized_message before any tool body can reach them.
-        context = SpreadsheetContext(
-            sheets_service=None,
-            drive_service=None,
-            docs_service=None,
-            calendar_service=None,
-            activity_service=None,
-            gmail_service=None,
-            folder_id=DRIVE_FOLDER_ID if DRIVE_FOLDER_ID else None,
-            auth_method="none",
-            unauthorized_message=unauthorized,
-        )
-        _lifespan_context = context
-        try:
-            yield context
-        finally:
-            _lifespan_context = None
-        return
+        return _degraded_context(unauthorized)
 
     logger.debug("Auth resolved: %s", resolved)
     is_service_account_identity = _is_service_account_credential(creds)
@@ -600,7 +934,7 @@ async def spreadsheet_lifespan(server: MCPServer) -> AsyncIterator[SpreadsheetCo
     activity_service = build("driveactivity", "v2", credentials=creds, cache_discovery=False)
     gmail_service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-    context = SpreadsheetContext(
+    return SpreadsheetContext(
         sheets_service=sheets_service,
         drive_service=drive_service,
         docs_service=docs_service,
@@ -612,8 +946,3 @@ async def spreadsheet_lifespan(server: MCPServer) -> AsyncIterator[SpreadsheetCo
         is_service_account_identity=is_service_account_identity,
         cache=SheetStructureCache(),
     )
-    _lifespan_context = context
-    try:
-        yield context
-    finally:
-        _lifespan_context = None
